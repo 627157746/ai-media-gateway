@@ -38,7 +38,7 @@ docker compose up -d --build
 |---|---|---|
 | `ADMIN_TOKEN` | （必填） | 管理 API `/admin/*` 的 Bearer token |
 | `MASTER_KEY` | （必填） | 账户密钥加密主密钥（任意字符串，内部取 SHA-256 作 AES 密钥） |
-| `LISTEN_ADDR` | `:8080` | 监听地址 |
+| `LISTEN_ADDR` | `:8090` | 监听地址 |
 | `DB_PATH` | `data/gateway.db` | SQLite 数据库路径（父目录自动创建） |
 | `MAX_BODY_MB` | `100` | 请求体大小上限（MB） |
 | `IMAGE_TIMEOUT` | `5m` | 图片/语音等同步生成任务的上游等待超时 |
@@ -54,12 +54,12 @@ docker compose up -d --build
 
 ## 管理 API 快速上手
 
-以下示例假设网关跑在 `http://localhost:8080`，`ADMIN_TOKEN=admintoken`。
+以下示例假设网关跑在 `http://localhost:8090`，`ADMIN_TOKEN=admintoken`。
 
 ### 1. 创建网关访问密钥（客户端用）
 
 ```bash
-curl -X POST http://localhost:8080/admin/keys \
+curl -X POST http://localhost:8090/admin/keys \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"name":"canvas"}'
 # → {"id":"...","name":"canvas","key":"sk-mg-..."}   之后可在 API Key 页随时复制
@@ -70,15 +70,15 @@ curl -X POST http://localhost:8080/admin/keys \
 fal，挂两个账户（优先级/权重控制调度）：
 
 ```bash
-curl -X POST http://localhost:8080/admin/providers \
+curl -X POST http://localhost:8090/admin/providers \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"id":"fal","type":"fal","base_url":"https://queue.fal.run"}'
 
-curl -X POST http://localhost:8080/admin/providers/fal/accounts \
+curl -X POST http://localhost:8090/admin/providers/fal/accounts \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"name":"fal-main","api_key":"fal-key-1","priority":0,"weight":3}'
 
-curl -X POST http://localhost:8080/admin/providers/fal/accounts \
+curl -X POST http://localhost:8090/admin/providers/fal/accounts \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"name":"fal-backup","api_key":"fal-key-2","priority":0,"weight":1}'
 # 同优先级组内按 3:1 轮询；不同 priority 时高值组先被尝试
@@ -87,17 +87,17 @@ curl -X POST http://localhost:8080/admin/providers/fal/accounts \
 ElevenLabs / Fish Audio：
 
 ```bash
-curl -X POST http://localhost:8080/admin/providers \
+curl -X POST http://localhost:8090/admin/providers \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"id":"el","type":"elevenlabs"}'
-curl -X POST http://localhost:8080/admin/providers/el/accounts \
+curl -X POST http://localhost:8090/admin/providers/el/accounts \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"api_key":"el-key","options":{"default_voice":"Rachel"}}'
 
-curl -X POST http://localhost:8080/admin/providers \
+curl -X POST http://localhost:8090/admin/providers \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"id":"fish","type":"fishaudio"}'
-curl -X POST http://localhost:8080/admin/providers/fish/accounts \
+curl -X POST http://localhost:8090/admin/providers/fish/accounts \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"api_key":"fish-key"}'
 ```
@@ -106,7 +106,7 @@ curl -X POST http://localhost:8080/admin/providers/fish/accounts \
 
 ```bash
 # fal 视频模型（文生/图生走不同上游端点，时长参数为 "5s" 格式）
-curl -X POST http://localhost:8080/admin/models \
+curl -X POST http://localhost:8090/admin/models \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{
     "id":"seedance-2.5","provider_id":"fal","kind":"video",
@@ -117,20 +117,20 @@ curl -X POST http://localhost:8080/admin/models \
     }}'
 
 # fal 图片模型（带编辑端点）
-curl -X POST http://localhost:8080/admin/models \
+curl -X POST http://localhost:8090/admin/models \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"id":"flux-pro","provider_id":"fal","kind":"image",
        "upstream":"fal-ai/flux-pro/v1.1",
        "options":{"upstream_edit":"fal-ai/flux-pro/v1.1/edit"}}'
 
 # ElevenLabs 语音（voices 别名映射：对外名字 → 上游 voice_id）
-curl -X POST http://localhost:8080/admin/models \
+curl -X POST http://localhost:8090/admin/models \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"id":"eleven-v3","provider_id":"el","kind":"speech","upstream":"eleven_v3",
        "options":{"voices":{"narrator":"21m00Tcm4TlvDq8ikWAM"},"default_voice":"narrator"}}'
 
 # Fish Audio 语音
-curl -X POST http://localhost:8080/admin/models \
+curl -X POST http://localhost:8090/admin/models \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"id":"fish-s2","provider_id":"fish","kind":"speech","upstream":"s2"}'
 ```
@@ -148,10 +148,10 @@ curl -X POST http://localhost:8080/admin/models \
 - 观察与干预：
 
 ```bash
-curl http://localhost:8080/admin/status -H "Authorization: Bearer admintoken"   # 各账户 state/cooling/计数
-curl -X POST http://localhost:8080/admin/accounts/<id>/reset -H "Authorization: Bearer admintoken"  # 手动复位
-curl "http://localhost:8080/admin/logs?limit=50" -H "Authorization: Bearer admintoken"              # 请求日志
-curl "http://localhost:8080/admin/tasks?status=queued" -H "Authorization: Bearer admintoken"        # 视频任务
+curl http://localhost:8090/admin/status -H "Authorization: Bearer admintoken"   # 各账户 state/cooling/计数
+curl -X POST http://localhost:8090/admin/accounts/<id>/reset -H "Authorization: Bearer admintoken"  # 手动复位
+curl "http://localhost:8090/admin/logs?limit=50" -H "Authorization: Bearer admintoken"              # 请求日志
+curl "http://localhost:8090/admin/tasks?status=queued" -H "Authorization: Bearer admintoken"        # 视频任务
 ```
 
 ## 代理
@@ -168,12 +168,12 @@ curl "http://localhost:8080/admin/tasks?status=queued" -H "Authorization: Bearer
 
 ```bash
 # 例：让 fal 平台的所有请求走本地 Clash
-curl -X PATCH http://localhost:8080/admin/providers/fal -H "Authorization: Bearer admintoken" \
+curl -X PATCH http://localhost:8090/admin/providers/fal -H "Authorization: Bearer admintoken" \
   -d '{"proxy_url":"http://127.0.0.1:7890"}'
 # 例：全局走 socks5，但某个 key 直连
-curl -X PATCH http://localhost:8080/admin/settings -H "Authorization: Bearer admintoken" \
+curl -X PATCH http://localhost:8090/admin/settings -H "Authorization: Bearer admintoken" \
   -d '{"proxy_url":"socks5://127.0.0.1:1080"}'
-curl -X PATCH http://localhost:8080/admin/accounts/<id> -H "Authorization: Bearer admintoken" \
+curl -X PATCH http://localhost:8090/admin/accounts/<id> -H "Authorization: Bearer admintoken" \
   -d '{"proxy_url":"direct"}'
 ```
 
@@ -182,7 +182,7 @@ curl -X PATCH http://localhost:8080/admin/accounts/<id> -H "Authorization: Beare
 ### Infinite Canvas
 
 - 渠道类型：**OpenAI**
-- `baseUrl`：`http://<host>:8080`（**不要**带 `/v1`，Canvas 会自己拼 `/v1`）
+- `baseUrl`：`http://<host>:8090`（**不要**带 `/v1`，Canvas 会自己拼 `/v1`）
 - `apiKey`：上面第 1 步创建的 `sk-mg-...` 网关密钥
 - 模型：填注册的模型 id（如 `seedance-2.5`、`flux-pro`、`eleven-v3`），或直通名 `fal/<fal 端点>`
 - Canvas 按模型名猜测能力类型（名字含 video/tts/image 等关键词），不读取 `/v1/models` 的 `kind`；「从平台获取」导入时会自动补 `-video` / `-tts` / `-image` 后缀，识别不对时在 Canvas 渠道编辑里手动切换能力即可。

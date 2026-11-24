@@ -9,7 +9,7 @@
 - `/v1/*` requires `Authorization: Bearer sk-mg-…` (SHA-256-checked gateway key, `store.AuthenticateKey`) **or** `Bearer <ADMIN_TOKEN>` (constant-time compare — the built-in 试用 page uses this; admin-token callers get no APIKey in ctx). `/admin/*` requires `Bearer <ADMIN_TOKEN>` (constant-time compare). `OPTIONS` preflight passes without auth → 204.
 - CORS (`server/middleware.go`): `Allow-Origin` per `CORS_ORIGINS` (`*` default, else echo matching origin + `Vary: Origin`); echoes `Access-Control-Request-Headers` back in `Allow-Headers` (else default `Authorization, Content-Type, X-Request-Id, Range`); `Max-Age: 600`; exposes `Content-Length, Content-Type, X-Request-Id, Content-Range, Accept-Ranges`.
 - All errors are the OpenAI shape `{"error":{"message","type","code"}}` — see `error-handling.md`.
-- **Canvas note**: set channel type `OpenAI` and `baseUrl` = `http://<host>:8080` with **no `/v1`** — the Canvas app appends `/v1` itself.
+- **Canvas note**: set channel type `OpenAI` and `baseUrl` = `http://<host>:8090` with **no `/v1`** — the Canvas app appends `/v1` itself.
 
 ## Endpoints (`internal/openai/`)
 

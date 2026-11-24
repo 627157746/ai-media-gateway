@@ -72,7 +72,7 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		ListenAddr:   str("LISTEN_ADDR", ":8080"),
+		ListenAddr:   str("LISTEN_ADDR", ":8090"),
 		DBPath:       str("DB_PATH", "data/gateway.db"),
 		AdminToken:   req("ADMIN_TOKEN"),
 		MasterKey:    req("MASTER_KEY"),
