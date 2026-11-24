@@ -30,7 +30,6 @@ Every package that talks to a vendor uses an in-process `httptest.Server` fixtur
 ## Required verification commands
 
 ```powershell
-$env:GOFLAGS='-buildvcs=false'   # mandatory on the UNC/SMB checkout (git dubious-ownership breaks VCS stamping)
 go vet ./...
 go test ./...
 go build -o bin/gateway.exe ./cmd/gateway

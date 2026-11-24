@@ -23,8 +23,6 @@ go run ./cmd/gateway
 # 或先构建： go build -o bin/gateway.exe ./cmd/gateway; ./bin/gateway.exe
 ```
 
-**注意**：如果项目放在 UNC/SMB 共享路径上，Go 的 VCS 标记会因 git "dubious ownership" 失败，请设置 `GOFLAGS=-buildvcs=false`（PowerShell：`$env:GOFLAGS='-buildvcs=false'`）。
-
 ### Docker
 
 ```bash
@@ -32,7 +30,7 @@ cp .env.example .env   # 填入 ADMIN_TOKEN 和 MASTER_KEY
 docker compose up -d --build
 ```
 
-数据库存放在 `./data/gateway.db`（容器内 `/data`）。**不要把数据库放在 SMB/NFS 共享盘上**，SQLite 依赖本地文件锁，网络文件系统可能导致锁损坏。
+数据库存放在 `./data/gateway.db`（容器内 `/data`）。
 
 ## 环境变量
 
@@ -182,7 +180,6 @@ curl "http://localhost:8080/admin/tasks?status=queued" -H "Authorization: Bearer
 ## 构建与测试
 
 ```powershell
-$env:GOFLAGS='-buildvcs=false'   # UNC/SMB 路径必须
 go vet ./...
 go test ./...
 go build -o bin/gateway.exe ./cmd/gateway

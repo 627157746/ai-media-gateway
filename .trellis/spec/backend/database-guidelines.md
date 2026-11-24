@@ -8,7 +8,6 @@
 
 - `database/sql` + `modernc.org/sqlite` driver name `sqlite`; `SetMaxOpenConns(1)` — serializes writes, avoids `SQLITE_BUSY` races.
 - Pragmas set on open: `journal_mode=WAL`, `busy_timeout`, `foreign_keys=ON`. Reuse `Open`; do not open a second `sql.DB`.
-- **`DB_PATH` must be a local disk.** Never point it at an SMB/NFS share — SQLite file locking breaks over network filesystems (documented in `README.md`; tests use `t.TempDir()`).
 
 ## Migrations (`internal/store/migrations/`)
 

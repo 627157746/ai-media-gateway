@@ -26,5 +26,5 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
 - Test: `go test ./...`
 - Vet: `go vet ./...`
 - Run: `gateway.exe` with env `ADMIN_TOKEN` and `MASTER_KEY` required; see `internal/config` for all vars (`LISTEN_ADDR` default `:8080`, `DB_PATH` default `data/gateway.db`).
-- UNC/SMB share note: when building on a UNC path, Go's VCS stamping fails on `git` dubious-ownership — set `GOFLAGS=-buildvcs=false` (e.g. `$env:GOFLAGS='-buildvcs=false'` in PowerShell).
+- Shell: Git for Windows is installed at non-default `D:\develop\Git`; the junction `%LOCALAPPDATA%\Programs\Git` → `D:\develop\Git` lets Devin find Git Bash. Without it, `bash` resolves to the WSL stub (no distro installed) and the Trellis hooks in `.claude/settings.json` fail with exit code 1.
 - Only non-stdlib dependency: `modernc.org/sqlite` (pure Go, no cgo; `CGO_ENABLED=0` builds work).
