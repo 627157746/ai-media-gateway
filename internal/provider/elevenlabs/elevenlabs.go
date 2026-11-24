@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"ai-media-gateway/internal/media"
 	"ai-media-gateway/internal/provider"
@@ -43,7 +45,18 @@ func invalid(msg string) *media.UpstreamError {
 func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest) (*media.Audio, error) {
 	voice := provider.ResolveVoice(c, r.Voice)
 	if voice == "" {
-		return nil, invalid("voice is required for ElevenLabs (set voice or default_voice)")
+		// Nothing configured: fall back to the first voice in the account's
+		// own library so the adapter works out of the box. An explicit voice
+		// (including OpenAI names such as "alloy") is still passed through
+		// untouched — only an empty voice triggers this lookup.
+		v, err := firstVoice(ctx, c)
+		if err != nil {
+			return nil, err
+		}
+		if v == "" {
+			return nil, invalid("voice is required for ElevenLabs: set voice, configure default_voice, or add a voice to the API key's library")
+		}
+		voice = v
 	}
 	format, ok := formatMap[strings.ToLower(r.Format)]
 	if !ok {
@@ -147,6 +160,60 @@ func (Adapter) ListModels(ctx context.Context, c provider.Call, q provider.Model
 		})
 	}
 	return out, nil
+}
+
+// voiceCacheTTL bounds how long an auto-picked default voice is reused. The
+// id is per base URL + account, so a changed key or endpoint re-resolves.
+const voiceCacheTTL = 10 * time.Minute
+
+type voiceCacheEntry struct {
+	id      string
+	expires time.Time
+}
+
+var defaultVoiceCache sync.Map // "base|accountID" → voiceCacheEntry
+
+// firstVoice returns the first voice_id in the account's ElevenLabs library
+// (GET /v1/voices), or "" when the library is empty. Results are cached; an
+// empty library is not cached so newly created voices are picked up at once.
+func firstVoice(ctx context.Context, c provider.Call) (string, error) {
+	key := c.BaseURL(defaultBase) + "|" + c.Account.ID
+	if v, ok := defaultVoiceCache.Load(key); ok {
+		if e := v.(voiceCacheEntry); time.Now().Before(e.expires) {
+			return e.id, nil
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL(defaultBase)+"/v1/voices", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("xi-api-key", c.Account.APIKey)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", provider.TransportError(err, false)
+	}
+	if resp.StatusCode/100 != 2 {
+		return "", statusError(resp)
+	}
+	var out struct {
+		Voices []struct {
+			VoiceID string `json:"voice_id"`
+		} `json:"voices"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if err != nil {
+		return "", &media.UpstreamError{
+			Class: media.ClassUpstream, Status: resp.StatusCode,
+			Message: "bad voices response: " + err.Error(),
+		}
+	}
+	if len(out.Voices) == 0 {
+		return "", nil
+	}
+	id := out.Voices[0].VoiceID
+	defaultVoiceCache.Store(key, voiceCacheEntry{id: id, expires: time.Now().Add(voiceCacheTTL)})
+	return id, nil
 }
 
 // statusError maps ElevenLabs errors; detail may be {status,message}, a

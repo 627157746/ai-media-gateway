@@ -123,7 +123,8 @@ curl -X POST http://localhost:8090/admin/models \
        "upstream":"fal-ai/flux-pro/v1.1",
        "options":{"upstream_edit":"fal-ai/flux-pro/v1.1/edit"}}'
 
-# ElevenLabs 语音（voices 别名映射：对外名字 → 上游 voice_id）
+# ElevenLabs 语音（voices 别名映射：对外名字 → 上游 voice_id；可省略，
+# 不配时自动取该 key 音色库里的第一个音色）
 curl -X POST http://localhost:8090/admin/models \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"id":"eleven-v3","provider_id":"el","kind":"speech","upstream":"eleven_v3",

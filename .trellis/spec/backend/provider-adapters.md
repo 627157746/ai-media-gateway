@@ -37,6 +37,7 @@ Queue protocol — **always use the URLs fal returns**, never recompute them:
 - `POST {base|https://api.elevenlabs.io}/v1/text-to-speech/{url-escaped voice}?output_format=X`, `xi-api-key` header, JSON body `{"text","model_id":<Upstream>}`.
 - `speed` → `voice_settings.speed` clamped `[0.7,1.2]`; `extra` merges top-level (a `voice_settings` object in `extra` gets speed merged in, not overwritten). `instructions` ignored.
 - `output_format`: `""`/`mp3`→`mp3_44100_128`, `opus`→`opus_48000_128`, `pcm`→`pcm_24000`, `wav`→`wav_44100`; anything else → `ClassInvalid`.
+- **Voice fallback (`firstVoice`)**: when `ResolveVoice` yields empty, `GET {base}/v1/voices` and take `voices[0].voice_id` — the account's own library, so the adapter works with zero configuration. Cached in a package `sync.Map` keyed `"<base>|<account id>"` for `voiceCacheTTL` (10 min); an **empty library is not cached** (a freshly created voice is picked up on the next call). An empty library → `ClassInvalid` "voice is required …". A non-empty voice — including OpenAI names like `alloy` — is passed through untouched, never remapped (client-visible 404 is intentional).
 - Returns `Audio{Body: resp.Body}` — streamed, not buffered.
 
 ## Fish Audio (`internal/provider/fishaudio/fishaudio.go`, type `fishaudio`, speech only)
@@ -47,7 +48,7 @@ Queue protocol — **always use the URLs fal returns**, never recompute them:
 
 ## Voice resolution (`provider/voice.go` `ResolveVoice`)
 
-`ResolveVoice(call, voice)`: if `voice` non-empty, look it up in the `voices` alias map of **account options → model options → provider options** (first hit wins); if `voice` empty, use `default_voice` from the same chain; else return `voice` unchanged. ElevenLabs with no resolvable voice → `ClassInvalid` "voice is required …".
+`ResolveVoice(call, voice)`: if `voice` non-empty, look it up in the `voices` alias map of **account options → model options → provider options** (first hit wins); if `voice` empty, use `default_voice` from the same chain; else return `voice` unchanged. ElevenLabs then falls back to the account's first library voice (see above); with an empty library too → `ClassInvalid` "voice is required …". Fish Audio simply omits `reference_id`.
 
 ## Rules for adapters
 

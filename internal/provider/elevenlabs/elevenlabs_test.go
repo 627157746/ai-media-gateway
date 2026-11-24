@@ -16,20 +16,33 @@ import (
 
 type captured struct {
 	path        string
+	paths       []string
 	query       url.Values
 	apiKey      string
 	body        map[string]any
 	status      int
 	respBody    []byte
 	respHeaders map[string]string
+	// voicesPath is the response for GET /v1/voices (JSON), empty→`{"voices":[]}`.
+	voicesPath []byte
 }
 
 func fakeEL(t *testing.T, cap *captured) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cap.path = r.URL.Path
+		cap.paths = append(cap.paths, r.URL.Path)
 		cap.query = r.URL.Query()
 		cap.apiKey = r.Header.Get("xi-api-key")
+		if r.URL.Path == "/v1/voices" {
+			body := cap.voicesPath
+			if len(body) == 0 {
+				body = []byte(`{"voices":[]}`)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(body)
+			return
+		}
 		_ = json.NewDecoder(r.Body).Decode(&cap.body)
 		for k, v := range cap.respHeaders {
 			w.Header().Set(k, v)
@@ -90,12 +103,48 @@ func TestVoiceDefaultAndChain(t *testing.T) {
 	if cap.path != "/v1/text-to-speech/p-voice" {
 		t.Fatalf("path: %s", cap.path)
 	}
-	// empty voice with no default → Invalid
+	// empty library + nothing configured → Invalid
 	c = call(srv, "m")
 	_, err := Adapter{}.Speak(context.Background(), c, media.SpeechRequest{Input: "t"})
 	var ue *media.UpstreamError
 	if !errors.As(err, &ue) || ue.Class != media.ClassInvalid {
 		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestVoiceAutoPick(t *testing.T) {
+	cap := &captured{
+		respBody:   []byte("x"),
+		voicesPath: []byte(`{"voices":[{"voice_id":"auto-1","name":"Auto One"},{"voice_id":"auto-2"}]}`),
+	}
+	srv := fakeEL(t, cap)
+	c := call(srv, "m")
+	c.Account.ID = "acc-auto"
+	defaultVoiceCache.Delete(srv.URL + "|acc-auto")
+	if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{Input: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if cap.path != "/v1/text-to-speech/auto-1" {
+		t.Fatalf("path: %s (want first library voice)", cap.path)
+	}
+	if len(cap.paths) != 2 || cap.paths[0] != "/v1/voices" {
+		t.Fatalf("lookup order: %v", cap.paths)
+	}
+	// second call reuses the cached id: no extra /v1/voices hit
+	cap.paths = nil
+	if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{Input: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cap.paths) != 1 || cap.paths[0] != "/v1/text-to-speech/auto-1" {
+		t.Fatalf("cached call: %v", cap.paths)
+	}
+	// an explicit OpenAI-style name is passed through, never resolved
+	cap.paths = nil
+	if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{Input: "t", Voice: "alloy"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cap.paths) != 1 || cap.paths[0] != "/v1/text-to-speech/alloy" {
+		t.Fatalf("passthrough call: %v", cap.paths)
 	}
 }
 
