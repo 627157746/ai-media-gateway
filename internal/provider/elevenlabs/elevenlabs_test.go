@@ -250,3 +250,86 @@ func TestListModels(t *testing.T) {
 		t.Fatalf("q filter: %+v", page.Models)
 	}
 }
+
+func TestListVoices(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/v1/voices" {
+			t.Errorf("path: %s", r.URL.Path)
+		}
+		if r.Header.Get("xi-api-key") != "k" {
+			t.Errorf("key header: %q", r.Header.Get("xi-api-key"))
+		}
+		io.WriteString(w, `{"voices":[
+			{"voice_id":"id-a","name":"Roger","category":"premade","labels":{"language":"en"}},
+			{"voice_id":"id-b","name":"","category":"cloned"},
+			{"voice_id":"","name":"no-id"}
+		]}`)
+	}))
+	defer srv.Close()
+
+	c := provider.Call{
+		Provider: provider.ProviderConfig{ID: "el", Type: "elevenlabs", BaseURL: srv.URL},
+		Account:  provider.AccountConfig{ID: "unique-acct-1", APIKey: "k"},
+		HTTP:     srv.Client(),
+	}
+	out, err := Adapter{}.ListVoices(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Entries without a voice_id are dropped; an empty name falls back to the id.
+	if len(out) != 2 {
+		t.Fatalf("want 2, got %d: %+v", len(out), out)
+	}
+	if out[0].ID != "id-a" || out[0].Name != "Roger" || out[0].Detail != "premade · en" {
+		t.Fatalf("voice0: %+v", out[0])
+	}
+	if out[1].Name != "id-b" {
+		t.Fatalf("empty name should fall back to id: %+v", out[1])
+	}
+
+	// A non-empty library is cached: the second call must not hit the vendor.
+	if _, err := (Adapter{}).ListVoices(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected cached second call, vendor hit %d times", calls)
+	}
+}
+
+// TestLanguageForwarded covers language_code, which multilingual v2 rejects —
+// so it must only be sent when the caller set it.
+func TestLanguageForwarded(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "x")
+	}))
+	defer srv.Close()
+	c := provider.Call{
+		Provider: provider.ProviderConfig{ID: "el", Type: "elevenlabs", BaseURL: srv.URL},
+		Account:  provider.AccountConfig{ID: "a1", APIKey: "k"},
+		HTTP:     srv.Client(),
+	}
+	if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{
+		Input: "hi", Voice: "v1", VoiceResolved: true, Language: "zh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got["language_code"] != "zh" {
+		t.Fatalf("language_code: %v", got)
+	}
+
+	// Unset language must not appear at all.
+	got = nil
+	if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{
+		Input: "hi", Voice: "v1", VoiceResolved: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := got["language_code"]; has {
+		t.Fatalf("language_code sent when unset: %v", got)
+	}
+}

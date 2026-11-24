@@ -23,6 +23,9 @@ import (
 	_ "ai-media-gateway/internal/provider/elevenlabs"
 	_ "ai-media-gateway/internal/provider/fal"
 	_ "ai-media-gateway/internal/provider/fishaudio"
+	_ "ai-media-gateway/internal/provider/heygen"
+	_ "ai-media-gateway/internal/provider/mimo"
+	_ "ai-media-gateway/internal/provider/muse"
 )
 
 func main() {
@@ -46,8 +49,8 @@ func run() error {
 	box := secret.New(cfg.MasterKey)
 	clients := netproxy.NewClients(cfg.HTTPTimeout)
 	pool := accounts.New(st, box, cfg.Cooldowns, clients, time.Now)
-	adminHandler := admin.New(st, box, clients)
-	openaiHandler := openai.New(st, pool)
+	adminHandler := admin.New(st, box, clients, cfg.DBPath)
+	openaiHandler := openai.New(st, pool, cfg.DBPath)
 
 	srv := &http.Server{
 		Addr: cfg.ListenAddr,

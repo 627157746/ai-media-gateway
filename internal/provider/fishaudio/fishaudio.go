@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"strings"
 
+	"ai-media-gateway/internal/capability"
 	"ai-media-gateway/internal/media"
+	"ai-media-gateway/internal/msgpack"
 	"ai-media-gateway/internal/provider"
 )
 
@@ -38,22 +40,53 @@ func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest
 	if format == "" {
 		format = "mp3"
 	}
-	body := map[string]any{
-		"text":   r.Input,
-		"format": format,
-	}
-	if v := provider.ResolveVoice(c, r.Voice); v != "" {
-		body["reference_id"] = v
-	}
-	if r.Speed > 0 {
-		body["prosody"] = map[string]any{"speed": r.Speed}
-	}
-	for k, v := range r.Extra {
-		body[k] = v
-	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return nil, &media.UpstreamError{Class: media.ClassInvalid, Message: err.Error(), Final: true}
+	var (
+		raw         []byte
+		contentType string
+	)
+	if ref := r.ReferenceAudio; ref != nil && len(ref.Data) > 0 {
+		// Zero-shot cloning: the sample travels with every request inside
+		// references[], and /v1/tts only accepts that shape as MessagePack.
+		payload := msgpack.Map{
+			{Key: "text", Val: r.Input},
+			{Key: "references", Val: []any{
+				msgpack.Map{
+					{Key: "audio", Val: ref.Data},
+					{Key: "text", Val: ""},
+				},
+			}},
+			{Key: "format", Val: format},
+		}
+		if sp := capability.For("fishaudio").Speed.Clamp(r.Speed); sp > 0 {
+			payload = append(payload, msgpack.Pair{Key: "prosody", Val: msgpack.Map{{Key: "speed", Val: sp}}})
+		}
+		encoded, err := msgpack.Encode(payload)
+		if err != nil {
+			return nil, &media.UpstreamError{Class: media.ClassInvalid, Message: err.Error(), Final: true}
+		}
+		raw, contentType = encoded, "application/msgpack"
+	} else {
+		body := map[string]any{
+			"text":   r.Input,
+			"format": format,
+		}
+		if r.Language != "" {
+			body["language"] = r.Language
+		}
+		if v := speechVoice(c, r); v != "" {
+			body["reference_id"] = v
+		}
+		if sp := capability.For("fishaudio").Speed.Clamp(r.Speed); sp > 0 {
+			body["prosody"] = map[string]any{"speed": sp}
+		}
+		for k, v := range r.Extra {
+			body[k] = v
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, &media.UpstreamError{Class: media.ClassInvalid, Message: err.Error(), Final: true}
+		}
+		raw, contentType = encoded, "application/json"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.BaseURL(defaultBase)+"/v1/tts", bytes.NewReader(raw))
@@ -61,7 +94,7 @@ func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Account.APIKey)
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("model", c.Model.Upstream)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -75,6 +108,74 @@ func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest
 		ct = defCT
 	}
 	return &media.Audio{Body: resp.Body, ContentType: ct}, nil
+}
+
+// ListVoices returns the workspace's own TTS voices.
+//
+// Endpoint is GET {base|https://api.fish.audio}/model?self=true (verified
+// against the live API: /v1/model is 404, /model is 200). The list response
+// carries window_limited / max_offset: the server caps how far paging can
+// reach, so this fetches a single page and reports truncation instead of
+// silently paginating past the limit.
+func (Adapter) ListVoices(ctx context.Context, c provider.Call) ([]provider.UpstreamVoice, error) {
+	u := c.BaseURL(defaultBase) + "/model?self=true&page_size=100"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Account.APIKey)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, provider.TransportError(err, false)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, statusError(resp)
+	}
+	var out struct {
+		Total   int  `json:"total"`
+		HasMore bool `json:"has_more"`
+		Items   []struct {
+			ID         string   `json:"_id"`
+			Type       string   `json:"type"`
+			Title      string   `json:"title"`
+			State      string   `json:"state"`
+			Visibility string   `json:"visibility"`
+			Languages  []string `json:"languages"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, &media.UpstreamError{
+			Class: media.ClassUpstream, Status: resp.StatusCode,
+			Message: "bad voices response: " + err.Error(),
+		}
+	}
+	voices := make([]provider.UpstreamVoice, 0, len(out.Items))
+	for _, it := range out.Items {
+		// Only trained TTS voices can be used as reference_id; svc models and
+		// voices still training or failed would 4xx at synthesis time.
+		if it.ID == "" || it.Type != "tts" || it.State != "trained" {
+			continue
+		}
+		name := it.Title
+		if name == "" {
+			name = it.ID
+		}
+		detail := it.Visibility
+		if len(it.Languages) > 0 {
+			detail = strings.TrimSpace(detail + " · " + strings.Join(it.Languages, ","))
+		}
+		voices = append(voices, provider.UpstreamVoice{ID: it.ID, Name: name, Detail: detail})
+	}
+	return voices, nil
+}
+
+// speechVoice returns the vendor voice id, honouring an already-resolved one.
+func speechVoice(c provider.Call, r media.SpeechRequest) string {
+	if r.VoiceResolved {
+		return r.Voice
+	}
+	return provider.ResolveVoice(c, r.Voice)
 }
 
 // Fish Audio has no TTS-model list API; this mirrors the `model` header enum.

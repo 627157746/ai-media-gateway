@@ -20,14 +20,17 @@ import (
 )
 
 type handler struct {
-	st   *store.Store
-	pool *accounts.Pool
-	now  func() time.Time
+	st     *store.Store
+	pool   *accounts.Pool
+	now    func() time.Time
+	dbPath string // reference samples for zero-shot cloning live next to it
 }
 
 // New returns the /v1 handler (mounted behind gateway auth by server).
-func New(st *store.Store, pool *accounts.Pool) http.Handler {
-	h := &handler{st: st, pool: pool, now: time.Now}
+// dbPath locates the reference-audio directory (sibling of the SQLite file);
+// an empty value only disables zero-shot samples, not synthesis.
+func New(st *store.Store, pool *accounts.Pool, dbPath string) http.Handler {
+	h := &handler{st: st, pool: pool, now: time.Now, dbPath: dbPath}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /v1/models", h.listModels)
 	m.HandleFunc("POST /v1/images/generations", h.generateImage)
@@ -37,6 +40,7 @@ func New(st *store.Store, pool *accounts.Pool) http.Handler {
 	m.HandleFunc("GET /v1/videos/{id}", h.getVideo)
 	m.HandleFunc("GET /v1/videos/{id}/content", h.videoContent)
 	m.HandleFunc("POST /v1/audio/speech", h.speech)
+	m.HandleFunc("GET /v1/audio/voices", h.listVoices)
 	return m
 }
 

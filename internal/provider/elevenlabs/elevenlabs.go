@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"ai-media-gateway/internal/capability"
 	"ai-media-gateway/internal/media"
 	"ai-media-gateway/internal/provider"
 )
@@ -43,7 +46,10 @@ func invalid(msg string) *media.UpstreamError {
 }
 
 func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest) (*media.Audio, error) {
-	voice := provider.ResolveVoice(c, r.Voice)
+	voice := r.Voice
+	if !r.VoiceResolved {
+		voice = provider.ResolveVoice(c, voice)
+	}
 	if voice == "" {
 		// Nothing configured: fall back to the first voice in the account's
 		// own library so the adapter works out of the box. An explicit voice
@@ -69,17 +75,15 @@ func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest
 		"text":     r.Input,
 		"model_id": c.Model.Upstream,
 	}
+	// language_code exists in the API, but multilingual v2 rejects it. Sending
+	// it only when configured keeps both cases working.
+	if r.Language != "" {
+		body["language_code"] = r.Language
+	}
 	for k, v := range r.Extra {
 		body[k] = v
 	}
-	if r.Speed > 0 {
-		speed := r.Speed
-		if speed < 0.7 {
-			speed = 0.7
-		}
-		if speed > 1.2 {
-			speed = 1.2
-		}
+	if speed := capability.For("elevenlabs").Speed.Clamp(r.Speed); speed > 0 {
 		vs, _ := body["voice_settings"].(map[string]any)
 		if vs == nil {
 			vs = map[string]any{}
@@ -172,6 +176,158 @@ type voiceCacheEntry struct {
 }
 
 var defaultVoiceCache sync.Map // "base|accountID" → voiceCacheEntry
+
+// voiceListEntry caches the full voice library for the 从上游导入 picker.
+type voiceListEntry struct {
+	voices  []provider.UpstreamVoice
+	expires time.Time
+}
+
+var voiceListCache sync.Map // "base|accountID" → voiceListEntry
+
+// CloneVoice creates a durable IVC voice (POST /v1/voices/add). The request is
+// multipart and the boundary must be set by the client, so Content-Type is
+// never assigned by hand.
+func (Adapter) CloneVoice(ctx context.Context, c provider.Call, r provider.CloneRequest) (*provider.CloneResult, error) {
+	if len(r.Files) == 0 {
+		return nil, invalid("至少需要一个音频样本")
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("name", r.Name); err != nil {
+		return nil, err
+	}
+	if r.Description != "" {
+		if err := mw.WriteField("description", r.Description); err != nil {
+			return nil, err
+		}
+	}
+	if r.RemoveBackgroundNoise {
+		if err := mw.WriteField("remove_background_noise", "true"); err != nil {
+			return nil, err
+		}
+	}
+	for i, data := range r.Files {
+		part, err := mw.CreateFormFile("files", fmt.Sprintf("sample-%d%s", i+1, sniffAudioExt(data)))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := part.Write(data); err != nil {
+			return nil, err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL(defaultBase)+"/v1/voices/add", &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("xi-api-key", c.Account.APIKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, provider.TransportError(err, false)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, statusError(resp)
+	}
+	var out struct {
+		VoiceID              string `json:"voice_id"`
+		RequiresVerification bool   `json:"requires_verification"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, &media.UpstreamError{
+			Class: media.ClassUpstream, Status: resp.StatusCode,
+			Message: "bad clone response: " + err.Error(),
+		}
+	}
+	if out.VoiceID == "" {
+		return nil, &media.UpstreamError{Class: media.ClassUpstream, Final: true,
+			Message: "clone response has no voice_id"}
+	}
+	return &provider.CloneResult{VoiceID: out.VoiceID, RequiresVerification: out.RequiresVerification}, nil
+}
+
+// sniffAudioExt picks a filename extension from the file signature so the
+// upload carries a believable name; the vendor sniffs the bytes anyway.
+func sniffAudioExt(data []byte) string {
+	switch {
+	case len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WAVE":
+		return ".wav"
+	case len(data) >= 3 && string(data[0:3]) == "ID3":
+		return ".mp3"
+	case len(data) >= 2 && data[0] == 0xff && data[1]&0xe0 == 0xe0:
+		return ".mp3"
+	case len(data) >= 4 && string(data[0:4]) == "OggS":
+		return ".ogg"
+	case len(data) >= 4 && string(data[0:4]) == "fLaC":
+		return ".flac"
+	default:
+		return ".mp3"
+	}
+}
+
+// ListVoices returns the account's ElevenLabs voice library (GET /v1/voices),
+// including each voice's display name. An empty library is not cached, so a
+// freshly created voice shows up on the next call.
+func (Adapter) ListVoices(ctx context.Context, c provider.Call) ([]provider.UpstreamVoice, error) {
+	key := c.BaseURL(defaultBase) + "|" + c.Account.ID
+	if v, ok := voiceListCache.Load(key); ok {
+		if e := v.(voiceListEntry); time.Now().Before(e.expires) {
+			return e.voices, nil
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL(defaultBase)+"/v1/voices", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("xi-api-key", c.Account.APIKey)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, provider.TransportError(err, false)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, statusError(resp)
+	}
+	var out struct {
+		Voices []struct {
+			VoiceID  string            `json:"voice_id"`
+			Name     string            `json:"name"`
+			Category string            `json:"category"`
+			Labels   map[string]string `json:"labels"`
+		} `json:"voices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, &media.UpstreamError{
+			Class: media.ClassUpstream, Status: resp.StatusCode,
+			Message: "bad voices response: " + err.Error(),
+		}
+	}
+	voices := make([]provider.UpstreamVoice, 0, len(out.Voices))
+	for _, v := range out.Voices {
+		if v.VoiceID == "" {
+			continue
+		}
+		name := v.Name
+		if name == "" {
+			name = v.VoiceID
+		}
+		detail := v.Category
+		if lang := v.Labels["language"]; lang != "" {
+			detail = strings.TrimSpace(detail + " · " + lang)
+		}
+		voices = append(voices, provider.UpstreamVoice{ID: v.VoiceID, Name: name, Detail: detail})
+	}
+	if len(voices) > 0 {
+		voiceListCache.Store(key, voiceListEntry{voices: voices, expires: time.Now().Add(voiceCacheTTL)})
+	}
+	return voices, nil
+}
 
 // firstVoice returns the first voice_id in the account's ElevenLabs library
 // (GET /v1/voices), or "" when the library is empty. Results are cached; an

@@ -431,11 +431,24 @@ func firstURLUnder(result any, keys ...string) string {
 
 // ---- endpoint + input builders ----
 
+// videoEndpoint picks the endpoint for a request. Mirrors the image adapter's
+// upstream_edit handling: the request content decides, not just an explicit
+// mode, because a client that supplies reference images clearly wants reference
+// mode but may not set the field.
 func videoEndpoint(r media.VideoRequest, o modelOpts, up string) string {
-	if r.Mode == "reference" && o.UpstreamReference != "" {
+	// Reference media (images/videos/audio used as references) only exists on
+	// the reference endpoint, and asking for reference mode explicitly means the
+	// same thing.
+	// An explicit frames mode wins over leftover reference media: the client
+	// chose image-to-video, so it must not be silently repointed.
+	hasRefMedia := len(r.References) > 0 || len(r.Videos) > 0 || len(r.Audios) > 0
+	wantsReference := r.Mode == "reference" || (r.Mode != "frames" && hasRefMedia)
+	if wantsReference && o.UpstreamReference != "" {
 		return o.UpstreamReference
 	}
-	if (r.FirstFrame != nil || len(r.References) > 0) && o.UpstreamImage != "" {
+	// Any supplied image needs the image endpoint when no reference endpoint
+	// is configured (the pre-existing upstream_image contract).
+	if (r.FirstFrame != nil || r.LastFrame != nil || len(r.References) > 0) && o.UpstreamImage != "" {
 		return o.UpstreamImage
 	}
 	return up
@@ -535,6 +548,12 @@ func buildImageInput(r media.ImageRequest, o modelOpts) map[string]any {
 			in[name] = r.Background
 		}
 	}
+	// response_format carries OpenAI semantics (png/jpeg/webp, or url/b64_json
+	// to pick the response shape). fal's field is output_format and accepts only
+	// real formats, so the two response-shape markers are not forwarded.
+	if f := strings.TrimSpace(r.ResponseFormat); f != "" && f != "url" && f != "b64_json" {
+		set("format", "output_format", f)
+	}
 	if len(r.Images) > 0 {
 		urls := make([]string, len(r.Images))
 		for i, img := range r.Images {
@@ -562,7 +581,7 @@ func durationValue(seconds string, format string) any {
 	}
 }
 
-func buildVideoInput(r media.VideoRequest, o modelOpts) map[string]any {
+func buildVideoInput(r media.VideoRequest, o modelOpts, endpoint string) map[string]any {
 	in := map[string]any{}
 	for k, v := range o.Defaults {
 		in[k] = v
@@ -600,25 +619,57 @@ func buildVideoInput(r media.VideoRequest, o modelOpts) map[string]any {
 			in[name] = *r.Watermark
 		}
 	}
+	// The first-frame field name differs by vendor: MiniMax uses image_url,
+	// Alibaba uses start_image_url. Rather than hardcoding vendors here, the
+	// model's options.fields.first_frame names it (see the admin model entry);
+	// image_url is only the fallback. Sending the wrong name is silently ignored
+	// upstream, which looks like the frame was never applied.
 	if r.FirstFrame != nil {
 		set("first_frame", "image_url", r.FirstFrame.DataURL())
 	}
 	if r.LastFrame != nil {
 		set("last_frame", "end_image_url", r.LastFrame.DataURL())
 	}
+	// Reference media. fal names these fields by endpoint family: the
+	// reference-to-video family uses reference_image_urls / reference_video_urls
+	// / reference_audio_urls, while other endpoints use the shorter names.
+	// Sending the wrong one is silently ignored upstream, which looks like the
+	// references were never applied. A model can override either name via
+	// options.fields.
+	imageURLs, videoURLs, audioURLs := "image_urls", "video_url", "audio_url"
+	// The configured reference endpoint is reference-family by definition, even
+	// when its path does not spell out "reference-to-video" (capability also
+	// treats a "/reference" suffix as reference mode).
+	refFamily := (o.UpstreamReference != "" && endpoint == o.UpstreamReference) ||
+		strings.Contains(strings.ToLower(endpoint), "reference-to-video")
+	if refFamily {
+		imageURLs, videoURLs, audioURLs = "reference_image_urls", "reference_video_urls", "reference_audio_urls"
+	}
 	if len(r.References) > 0 {
 		urls := make([]string, len(r.References))
 		for i, img := range r.References {
 			urls[i] = img.DataURL()
 		}
-		set("references", "image_urls", urls)
+		set("references", imageURLs, urls)
 	}
-	if len(r.Videos) > 0 {
-		set("videos", "video_url", r.Videos[0].DataURL())
+	// The short names (video_url / audio_url) are scalar strings on fal; only
+	// the reference_* family takes arrays.
+	mediaURLs := func(key, name string, list []media.Input, array bool) {
+		if len(list) == 0 {
+			return
+		}
+		if !array {
+			set(key, name, list[0].DataURL())
+			return
+		}
+		urls := make([]string, len(list))
+		for i, v := range list {
+			urls[i] = v.DataURL()
+		}
+		set(key, name, urls)
 	}
-	if len(r.Audios) > 0 {
-		set("audios", "audio_url", r.Audios[0].DataURL())
-	}
+	mediaURLs("videos", videoURLs, r.Videos, refFamily)
+	mediaURLs("audios", audioURLs, r.Audios, refFamily)
 	return o.finish(in, r.Extra)
 }
 
@@ -633,8 +684,13 @@ func buildSpeechInput(r media.SpeechRequest, c provider.Call, o modelOpts) map[s
 		}
 	}
 	set("text", "text", r.Input)
-	if v := provider.ResolveVoice(c, r.Voice); v != "" {
-		set("voice", "voice", v)
+	// A voice from the 音色库 is already a vendor id: skip alias remapping.
+	voice := r.Voice
+	if !r.VoiceResolved {
+		voice = provider.ResolveVoice(c, voice)
+	}
+	if voice != "" {
+		set("voice", "voice", voice)
 	}
 	if r.Speed > 0 {
 		set("speed", "speed", r.Speed)
@@ -672,7 +728,7 @@ func (a Adapter) GenerateImage(ctx context.Context, c provider.Call, r media.Ima
 func (a Adapter) SubmitVideo(ctx context.Context, c provider.Call, r media.VideoRequest) (media.TaskHandle, error) {
 	opts := parseOpts(c.Model.Options)
 	endpoint := videoEndpoint(r, opts, c.Model.Upstream)
-	h, err := a.submit(ctx, c, endpoint, buildVideoInput(r, opts))
+	h, err := a.submit(ctx, c, endpoint, buildVideoInput(r, opts, endpoint))
 	if err != nil {
 		return nil, err
 	}

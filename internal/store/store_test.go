@@ -365,3 +365,97 @@ func TestProxyCRUDAndUsages(t *testing.T) {
 		t.Fatalf("deleted: %v", err)
 	}
 }
+
+// voicesRoundTrip covers the 音色库 CRUD path and the (provider_id,
+// upstream_id) uniqueness contract.
+func TestVoicesCRUD(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "v.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if err := st.CreateProvider(ctx, &Provider{ID: "p1", Type: "t", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	v := &Voice{Name: "中文旁白", ProviderID: "p1", UpstreamID: "up-1", Enabled: true}
+	if err := st.CreateVoice(ctx, v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.ID) == 0 || v.ID[:3] != "vc_" {
+		t.Fatalf("id: %q", v.ID)
+	}
+
+	got, err := st.GetVoice(ctx, v.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "中文旁白" || got.UpstreamID != "up-1" || !got.Enabled {
+		t.Fatalf("got: %+v", got)
+	}
+
+	// Same provider + same upstream id is a conflict.
+	dup := &Voice{Name: "dup", ProviderID: "p1", UpstreamID: "up-1", Enabled: true}
+	if err := st.CreateVoice(ctx, dup); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup err: %v", err)
+	}
+
+	// A different provider may reuse the same upstream id.
+	if err := st.CreateProvider(ctx, &Provider{ID: "p2", Type: "t", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	other := &Voice{Name: "other", ProviderID: "p2", UpstreamID: "up-1", Enabled: true}
+	if err := st.CreateVoice(ctx, other); err != nil {
+		t.Fatalf("cross-provider same upstream should be allowed: %v", err)
+	}
+
+	// FindVoice only matches enabled voices of the queried provider.
+	if f, err := st.FindVoice(ctx, "p1", v.ID); err != nil || f == nil {
+		t.Fatalf("find: %v %v", f, err)
+	}
+	if f, err := st.FindVoice(ctx, "p2", v.ID); err != nil || f != nil {
+		t.Fatalf("find cross-provider should be nil: %v %v", f, err)
+	}
+	off := false
+	if err := st.UpdateVoice(ctx, v.ID, nil, nil, &off); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := st.FindVoice(ctx, "p1", v.ID); err != nil || f != nil {
+		t.Fatalf("disabled voice must not resolve: %v %v", f, err)
+	}
+
+	if err := st.DeleteVoice(ctx, v.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetVoice(ctx, v.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after delete: %v", err)
+	}
+}
+
+// TestDeleteProviderBlocksVoices verifies a provider referenced only by a
+// voice is still protected from deletion.
+func TestDeleteProviderBlocksVoices(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "vd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if err := st.CreateProvider(ctx, &Provider{ID: "p1", Type: "t", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	v := &Voice{Name: "n", ProviderID: "p1", UpstreamID: "u", Enabled: true}
+	if err := st.CreateVoice(ctx, v); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteProvider(ctx, "p1"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+	if err := st.DeleteVoice(ctx, v.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteProvider(ctx, "p1"); err != nil {
+		t.Fatalf("after voice delete: %v", err)
+	}
+}

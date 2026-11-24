@@ -1,0 +1,47 @@
+{
+  "id": "voice-library",
+  "name": "voice-library",
+  "title": "语音音色库：独立 voices 表 + 管理页 + 别名映射",
+  "description": "在后台建立可复用的音色库（voices 表 / admin CRUD / 管理页 / GET /v1/audio/voices），并保持 canvas 零改动：通过 voices 别名映射把 canvas 硬编码的 alloy~cedar 13 个槽位劫持成真实上游音色。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": "backend+frontend",
+  "package": "internal/capability, internal/openai, internal/provider",
+  "priority": "P1",
+  "creator": "zhb",
+  "assignee": "zhb",
+  "createdAt": "2026-11-24",
+  "completedAt": "2026-11-24",
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [
+    {
+      "title": "音色库：voices 表 + admin CRUD + 管理页 + GET /v1/audio/voices",
+      "done": true
+    },
+    {
+      "title": "音色创建：克隆（ElevenLabs）/ 零样本（Fish/MiMo）",
+      "done": true
+    },
+    {
+      "title": "接入 heygen / mimo / muse 平台的语音与图片适配器",
+      "done": true
+    },
+    {
+      "title": "能力声明：从 fal OpenAPI 推导图片/视频参数并下发 /v1/models",
+      "done": true
+    },
+    {
+      "title": "试用页按能力动态渲染（语音/图片/视频）",
+      "done": true
+    }
+  ],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

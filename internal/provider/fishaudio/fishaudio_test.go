@@ -1,12 +1,14 @@
 package fishaudio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"ai-media-gateway/internal/media"
@@ -133,5 +135,175 @@ func TestListModels(t *testing.T) {
 	}
 	if len(page.Models) != 1 || page.Models[0].ID != "s3-pro" {
 		t.Fatalf("q filter: %+v", page.Models)
+	}
+}
+
+func TestListVoices(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/model" {
+			t.Errorf("path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("self") != "true" {
+			t.Errorf("self: %q", r.URL.Query().Get("self"))
+		}
+		if r.Header.Get("Authorization") != "Bearer k" {
+			t.Errorf("auth: %q", r.Header.Get("Authorization"))
+		}
+		io.WriteString(w, `{"total":3,"items":[
+			{"_id":"v-trained","type":"tts","title":"鲸鱼娘旁白","state":"trained","visibility":"public","languages":["zh"]},
+			{"_id":"v-training","type":"tts","title":"未训练好","state":"training"},
+			{"_id":"v-svc","type":"svc","title":"服务模型","state":"trained"}
+		]}`)
+	}))
+	defer srv.Close()
+
+	c := provider.Call{
+		Provider: provider.ProviderConfig{ID: "fa", Type: "fishaudio", BaseURL: srv.URL},
+		Account:  provider.AccountConfig{ID: "a1", APIKey: "k"},
+		HTTP:     srv.Client(),
+	}
+	out, err := Adapter{}.ListVoices(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the trained tts voice is usable as reference_id.
+	if len(out) != 1 {
+		t.Fatalf("want 1 usable voice, got %d: %+v", len(out), out)
+	}
+	if out[0].ID != "v-trained" || out[0].Name != "鲸鱼娘旁白" {
+		t.Fatalf("voice: %+v", out[0])
+	}
+	if !strings.Contains(out[0].Detail, "public") || !strings.Contains(out[0].Detail, "zh") {
+		t.Fatalf("detail: %q", out[0].Detail)
+	}
+}
+
+// TestSpeakZeroShotCloning verifies a reference sample is embedded as a
+// msgpack references[] payload instead of a reference_id lookup.
+func TestSpeakZeroShotCloning(t *testing.T) {
+	var (
+		gotCT    string
+		gotBody  []byte
+		gotModel string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCT = r.Header.Get("Content-Type")
+		gotModel = r.Header.Get("model")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "mp3")
+	}))
+	defer srv.Close()
+
+	sample := []byte{0xff, 0xfb, 0x90, 0x00}
+	c := provider.Call{
+		Provider: provider.ProviderConfig{ID: "fa", Type: "fishaudio", BaseURL: srv.URL},
+		Account:  provider.AccountConfig{ID: "a1", APIKey: "k"},
+		Model:    provider.ModelConfig{Upstream: "s2.1-pro-free"},
+		HTTP:     srv.Client(),
+	}
+	_, err := Adapter{}.Speak(context.Background(), c, media.SpeechRequest{
+		Input:          "hi",
+		Format:         "mp3",
+		ReferenceAudio: &media.Input{Name: "s.mp3", Data: sample},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCT != "application/msgpack" {
+		t.Fatalf("content type: %q", gotCT)
+	}
+	if gotModel != "s2.1-pro-free" {
+		t.Fatalf("model header: %q", gotModel)
+	}
+	// fixmap(3): "text" "hi" | "references" [ map(2): "audio" bin8{sample} "text" "" ] | "format" "mp3"
+	want := []byte{
+		0x83,
+		0xa4, 't', 'e', 'x', 't', 0xa2, 'h', 'i',
+		0xaa, 'r', 'e', 'f', 'e', 'r', 'e', 'n', 'c', 'e', 's',
+		0x91, 0x82,
+		0xa5, 'a', 'u', 'd', 'i', 'o', 0xc4, 0x04, 0xff, 0xfb, 0x90, 0x00,
+		0xa4, 't', 'e', 'x', 't', 0xa0,
+		0xa6, 'f', 'o', 'r', 'm', 'a', 't', 0xa3, 'm', 'p', '3',
+	}
+	if !bytes.Equal(gotBody, want) {
+		t.Fatalf("body mismatch\n got %x\nwant %x", gotBody, want)
+	}
+}
+
+// TestSpeakReferenceIDUnchanged guards the plain path: no sample means a JSON
+// body with reference_id, exactly as before cloning was added.
+func TestSpeakReferenceIDUnchanged(t *testing.T) {
+	var gotCT string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCT = r.Header.Get("Content-Type")
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "mp3")
+	}))
+	defer srv.Close()
+
+	c := provider.Call{
+		Provider: provider.ProviderConfig{ID: "fa", Type: "fishaudio", BaseURL: srv.URL},
+		Account:  provider.AccountConfig{ID: "a1", APIKey: "k"},
+		HTTP:     srv.Client(),
+	}
+	if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{
+		Input: "hi", Format: "mp3", Voice: "ref-1", VoiceResolved: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotCT != "application/json" {
+		t.Fatalf("content type: %q", gotCT)
+	}
+	if gotBody["reference_id"] != "ref-1" {
+		t.Fatalf("body: %v", gotBody)
+	}
+}
+
+// TestSpeedClamped covers Fish's documented 0.5–2.0 range: out-of-range
+// values must be clamped rather than sent and rejected.
+func TestSpeedClamped(t *testing.T) {
+	for _, c := range []struct{ in, want float64 }{
+		{0.2, 0.5}, {0.5, 0.5}, {1.0, 1.0}, {2.0, 2.0}, {3.5, 2.0},
+	} {
+		var got map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&got)
+			w.Header().Set("Content-Type", "audio/mpeg")
+			io.WriteString(w, "x")
+		}))
+		cc := provider.Call{
+			Provider: provider.ProviderConfig{ID: "fa", Type: "fishaudio", BaseURL: srv.URL},
+			Account:  provider.AccountConfig{ID: "a1", APIKey: "k"},
+			HTTP:     srv.Client(),
+		}
+		(Adapter{}).Speak(context.Background(), cc, media.SpeechRequest{Input: "hi", Speed: c.in, Voice: "vm", VoiceResolved: true})
+		srv.Close()
+		pr, _ := got["prosody"].(map[string]any)
+		if pr["speed"] != c.want {
+			t.Fatalf("speed %v → %v, want %v", c.in, pr["speed"], c.want)
+		}
+	}
+}
+
+// TestLanguageForwarded checks language reaches the request when set.
+func TestLanguageForwarded(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "x")
+	}))
+	defer srv.Close()
+	c := provider.Call{
+		Provider: provider.ProviderConfig{ID: "fa", Type: "fishaudio", BaseURL: srv.URL},
+		Account:  provider.AccountConfig{ID: "a1", APIKey: "k"},
+		HTTP:     srv.Client(),
+	}
+	(Adapter{}).Speak(context.Background(), c, media.SpeechRequest{Input: "hi", Speed: 1, Language: "zh-CN", Voice: "vm", VoiceResolved: true})
+	if got["language"] != "zh-CN" {
+		t.Fatalf("language not forwarded: %v", got)
 	}
 }

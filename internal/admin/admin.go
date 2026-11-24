@@ -32,14 +32,16 @@ type handler struct {
 	box     *secret.Box
 	clients *netproxy.Clients
 	now     func() time.Time
+	dbPath  string // reference-audio samples live next to the SQLite file
 }
 
 // New returns the admin API handler (already mounted under /admin/).
-func New(st *store.Store, box *secret.Box, clients *netproxy.Clients) http.Handler {
+// dbPath locates the reference-audio directory; empty disables cloning.
+func New(st *store.Store, box *secret.Box, clients *netproxy.Clients, dbPath string) http.Handler {
 	if clients == nil {
 		clients = netproxy.NewClients(0)
 	}
-	h := &handler{st: st, box: box, clients: clients, now: time.Now}
+	h := &handler{st: st, box: box, clients: clients, now: time.Now, dbPath: dbPath}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /admin/providers", h.listProviders)
 	m.HandleFunc("POST /admin/providers", h.createProvider)
@@ -47,6 +49,7 @@ func New(st *store.Store, box *secret.Box, clients *netproxy.Clients) http.Handl
 	m.HandleFunc("PATCH /admin/providers/{id}", h.patchProvider)
 	m.HandleFunc("DELETE /admin/providers/{id}", h.deleteProvider)
 	m.HandleFunc("GET /admin/providers/{id}/upstream-models", h.upstreamModels)
+	m.HandleFunc("GET /admin/providers/{id}/endpoint-schema", h.endpointSchema)
 	m.HandleFunc("GET /admin/providers/{id}/accounts", h.listAccounts)
 	m.HandleFunc("POST /admin/providers/{id}/accounts", h.createAccount)
 	m.HandleFunc("GET /admin/accounts/{id}", h.getAccount)
@@ -73,6 +76,12 @@ func New(st *store.Store, box *secret.Box, clients *netproxy.Clients) http.Handl
 	m.HandleFunc("POST /admin/proxies", h.createProxy)
 	m.HandleFunc("PATCH /admin/proxies/{id}", h.patchProxy)
 	m.HandleFunc("DELETE /admin/proxies/{id}", h.deleteProxy)
+	m.HandleFunc("GET /admin/voices", h.listVoices)
+	m.HandleFunc("POST /admin/voices", h.createVoice)
+	m.HandleFunc("PATCH /admin/voices/{id}", h.patchVoice)
+	m.HandleFunc("DELETE /admin/voices/{id}", h.deleteVoice)
+	m.HandleFunc("GET /admin/providers/{id}/upstream-voices", h.upstreamVoices)
+	m.HandleFunc("POST /admin/voices/clone", h.cloneVoice)
 	return m
 }
 
@@ -253,6 +262,69 @@ func (h *handler) patchProvider(w http.ResponseWriter, r *http.Request) {
 	h.getProvider(w, r)
 }
 
+// upstreamCall picks the highest-priority enabled account with a key
+// (non-cooling preferred), resolves the effective proxy, decrypts the key and
+// builds a provider.Call for an admin-side upstream query. The returned key is
+// the plaintext one — callers must pass errors through scrubKey.
+//
+// allowAnonymous is only for fal, whose catalog endpoint needs no key.
+func (h *handler) upstreamCall(ctx context.Context, p *store.Provider, allowAnonymous bool) (provider.Call, string, error) {
+	accs, err := h.st.ListAccounts(ctx, p.ID)
+	if err != nil {
+		return provider.Call{}, "", err
+	}
+	var pick, cooling *store.Account
+	now := h.now()
+	for _, a := range accs { // ListAccounts is ordered by priority DESC
+		if !a.Enabled || len(a.APIKeyEnc) == 0 {
+			continue
+		}
+		if a.CooldownUntil != nil && a.CooldownUntil.After(now) {
+			if cooling == nil {
+				cooling = a
+			}
+			continue
+		}
+		pick = a
+		break
+	}
+	if pick == nil {
+		pick = cooling
+	}
+	if pick == nil && !allowAnonymous {
+		return provider.Call{}, "", bad("该平台还没有可用的 key，请先添加")
+	}
+	global, err := h.st.GetSetting(ctx, "proxy_url")
+	if err != nil {
+		return provider.Call{}, "", err
+	}
+	acctProxy := ""
+	if pick != nil {
+		acctProxy = pick.ProxyURL
+	}
+	proxyURL, err := accounts.ResolveProxy(ctx, h.st, netproxy.Effective(acctProxy, p.ProxyURL, global))
+	if err != nil {
+		return provider.Call{}, "", err
+	}
+	call := provider.Call{
+		Provider: provider.ProviderConfig{ID: p.ID, Type: p.Type, BaseURL: p.BaseURL, ProxyURL: p.ProxyURL, Options: p.Options},
+	}
+	call.HTTP, call.Stream = h.clients.For(proxyURL)
+	key := ""
+	if pick != nil {
+		call.Account = provider.AccountConfig{
+			ID: pick.ID, Name: pick.Name, BaseURL: pick.BaseURL, Options: pick.Options,
+		}
+		raw, err := h.box.Open(pick.APIKeyEnc)
+		if err != nil {
+			return provider.Call{}, "", fmt.Errorf("decrypt key of account %s: %w", pick.ID, err)
+		}
+		key = string(raw)
+		call.Account.APIKey = key
+	}
+	return call, key, nil
+}
+
 // upstreamModels lists a provider's model catalog via the adapter's
 // ModelLister, using the highest-priority enabled account that has a key
 // (non-cooling preferred). fal may query anonymously; other types 400
@@ -273,61 +345,10 @@ func (h *handler) upstreamModels(w http.ResponseWriter, r *http.Request) {
 		fail(w, bad("平台 %s 不支持获取上游模型列表", p.Type))
 		return
 	}
-	accs, err := h.st.ListAccounts(r.Context(), p.ID)
+	call, key, err := h.upstreamCall(r.Context(), p, p.Type == "fal")
 	if err != nil {
 		fail(w, err)
 		return
-	}
-	var pick, cooling *store.Account
-	now := h.now()
-	for _, a := range accs { // ListAccounts is ordered by priority DESC
-		if !a.Enabled || len(a.APIKeyEnc) == 0 {
-			continue
-		}
-		if a.CooldownUntil != nil && a.CooldownUntil.After(now) {
-			if cooling == nil {
-				cooling = a
-			}
-			continue
-		}
-		pick = a
-		break
-	}
-	if pick == nil {
-		pick = cooling
-	}
-	if pick == nil && p.Type != "fal" {
-		fail(w, bad("该平台还没有可用的 key，请先添加"))
-		return
-	}
-	global, err := h.st.GetSetting(r.Context(), "proxy_url")
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	acctProxy := ""
-	if pick != nil {
-		acctProxy = pick.ProxyURL
-	}
-	url, err := accounts.ResolveProxy(r.Context(), h.st, netproxy.Effective(acctProxy, p.ProxyURL, global))
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	call := provider.Call{
-		Provider: provider.ProviderConfig{ID: p.ID, Type: p.Type, BaseURL: p.BaseURL, ProxyURL: p.ProxyURL, Options: p.Options},
-	}
-	call.HTTP, call.Stream = h.clients.For(url)
-	if pick != nil {
-		call.Account = provider.AccountConfig{
-			ID: pick.ID, Name: pick.Name, BaseURL: pick.BaseURL, Options: pick.Options,
-		}
-		key, err := h.box.Open(pick.APIKeyEnc)
-		if err != nil {
-			fail(w, fmt.Errorf("decrypt key of account %s: %w", pick.ID, err))
-			return
-		}
-		call.Account.APIKey = string(key)
 	}
 	qs := r.URL.Query()
 	page, err := lister.ListModels(r.Context(), call, provider.ModelQuery{
@@ -337,13 +358,51 @@ func (h *handler) upstreamModels(w http.ResponseWriter, r *http.Request) {
 		IDs:      qs["endpoint_id"],
 	})
 	if err != nil {
-		fail(w, scrubKey(err, call.Account.APIKey))
+		fail(w, scrubKey(err, key))
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"data":        page.Models,
 		"next_cursor": page.NextCursor,
 	})
+}
+
+// endpointSchema reports one upstream endpoint's declared input fields, so the
+// admin UI can show what a model accepts before it is created. The gateway
+// derives a model's capabilities from this rather than from a hardcoded table
+// that goes stale whenever the vendor adds or changes a model.
+func (h *handler) endpointSchema(w http.ResponseWriter, r *http.Request) {
+	p, err := h.st.GetProvider(r.Context(), r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	adapter, ok := provider.Get(p.Type)
+	if !ok {
+		fail(w, bad("unknown provider type %q", p.Type))
+		return
+	}
+	lister, ok := adapter.(provider.SchemaLister)
+	if !ok {
+		fail(w, bad("平台 %s 不提供端点参数说明", p.Type))
+		return
+	}
+	endpoint := r.URL.Query().Get("endpoint_id")
+	if endpoint == "" {
+		fail(w, bad("endpoint_id is required"))
+		return
+	}
+	call, key, err := h.upstreamCall(r.Context(), p, p.Type == "fal")
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	schema, err := lister.EndpointSchema(r.Context(), call, endpoint)
+	if err != nil {
+		fail(w, scrubKey(err, key))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, schema)
 }
 
 // scrubKey removes the decrypted API key from an upstream error (a vendor

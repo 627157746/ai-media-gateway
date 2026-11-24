@@ -496,3 +496,151 @@ func TestPollOwnTimeout(t *testing.T) {
 		t.Fatalf("message: %q", ue.Message)
 	}
 }
+
+// TestVideoReferenceFieldNames pins the endpoint-dependent naming: fal's
+// reference-to-video family expects reference_image_urls / reference_video_urls
+// / reference_audio_urls, and sending the shorter names there is silently
+// ignored (which looks like the references never applied).
+func TestVideoReferenceFieldNames(t *testing.T) {
+	q := newFakeFal(t)
+	q.resultBody = map[string]any{"video": map[string]any{"url": "v"}}
+	ref := media.Input{Data: []byte("x")}
+	c := call(q.Server, "minimax/h3-max/reference-to-video", `{}`)
+
+	if _, err := (Adapter{}).SubmitVideo(context.Background(), c, media.VideoRequest{
+		Prompt:     "p",
+		References: []media.Input{ref},
+		Videos:     []media.Input{ref},
+		Audios:     []media.Input{ref},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b := q.lastBody()
+	for _, k := range []string{"reference_image_urls", "reference_video_urls", "reference_audio_urls"} {
+		if _, ok := b[k]; !ok {
+			t.Fatalf("reference endpoint should send %s, body %v", k, b)
+		}
+	}
+	for _, k := range []string{"image_urls", "video_url", "audio_url"} {
+		if _, ok := b[k]; ok {
+			t.Fatalf("reference endpoint must not send %s, body %v", k, b)
+		}
+	}
+
+	// A non-reference endpoint keeps the short names.
+	q2 := newFakeFal(t)
+	q2.resultBody = map[string]any{"video": map[string]any{"url": "v"}}
+	c2 := call(q2.Server, "some/image-to-video", `{}`)
+	if _, err := (Adapter{}).SubmitVideo(context.Background(), c2, media.VideoRequest{
+		Prompt: "p", References: []media.Input{ref},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := q2.lastBody()["image_urls"]; !ok {
+		t.Fatalf("non-reference endpoint should keep image_urls: %v", q2.lastBody())
+	}
+}
+
+// TestVideoFirstFrameFieldName pins the vendor-dependent first-frame field.
+// MiniMax's h3-max takes image_url while Alibaba's wan takes start_image_url;
+// sending the wrong name is silently ignored upstream, so the frame would never
+// be applied and the failure would look like a model limitation.
+func TestVideoFirstFrameFieldName(t *testing.T) {
+	frame := &media.Input{Data: []byte("x")}
+
+	// Default: image_url.
+	in := buildVideoInput(media.VideoRequest{Prompt: "p", FirstFrame: frame},
+		parseOpts(nil), "minimax/h3-max/image-to-video")
+	if _, ok := in["image_url"]; !ok {
+		t.Fatalf("default should send image_url: %v", in)
+	}
+
+	// A model can pin the name via options.fields, which is how wan is wired.
+	in = buildVideoInput(media.VideoRequest{Prompt: "p", FirstFrame: frame},
+		parseOpts([]byte(`{"fields":{"first_frame":"start_image_url"}}`)),
+		"alibaba/wan-3.0/image-to-video")
+	if _, ok := in["start_image_url"]; !ok {
+		t.Fatalf("wan should send start_image_url: %v", in)
+	}
+	if _, ok := in["image_url"]; ok {
+		t.Fatalf("wan must not also send image_url: %v", in)
+	}
+}
+
+// TestVideoEndpointCombos pins videoEndpoint across request shapes, including
+// the two regressions this branch introduced: references with no reference
+// endpoint configured must still reach upstream_image, and an explicit frames
+// mode must not be repointed at the reference endpoint by leftover references.
+func TestVideoEndpointCombos(t *testing.T) {
+	ff := &media.Input{Data: []byte("x")}
+	refs := []media.Input{{Data: []byte("r")}}
+	both := parseOpts([]byte(`{"upstream_image":"a/i2v","upstream_reference":"a/ref"}`))
+	imgOnly := parseOpts([]byte(`{"upstream_image":"a/i2v"}`))
+	refOnly := parseOpts([]byte(`{"upstream_reference":"a/ref"}`))
+	cases := []struct {
+		name string
+		r    media.VideoRequest
+		o    modelOpts
+		want string
+	}{
+		{"prompt only", media.VideoRequest{}, both, "m/t2v"},
+		{"first frame", media.VideoRequest{FirstFrame: ff}, both, "a/i2v"},
+		{"last frame only", media.VideoRequest{LastFrame: ff}, both, "a/i2v"},
+		{"refs, no mode", media.VideoRequest{References: refs}, both, "a/ref"},
+		{"reference mode, no media", media.VideoRequest{Mode: "reference"}, both, "a/ref"},
+		{"ref video only", media.VideoRequest{Videos: refs}, both, "a/ref"},
+		{"frames mode + refs", media.VideoRequest{Mode: "frames", FirstFrame: ff, References: refs}, both, "a/i2v"},
+		{"refs, image endpoint only", media.VideoRequest{References: refs}, imgOnly, "a/i2v"},
+		{"first frame, reference endpoint only", media.VideoRequest{FirstFrame: ff}, refOnly, "m/t2v"},
+		{"refs, reference endpoint only", media.VideoRequest{References: refs}, refOnly, "a/ref"},
+		{"no options", media.VideoRequest{FirstFrame: ff, References: refs}, modelOpts{}, "m/t2v"},
+	}
+	for _, tc := range cases {
+		if got := videoEndpoint(tc.r, tc.o, "m/t2v"); got != tc.want {
+			t.Errorf("%s: got %s want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestVideoMediaFieldShapes pins the value TYPE, not just the key: fal's short
+// video_url / audio_url are scalar strings, only the reference_* family takes
+// arrays. Sending an array to video_url is a 422 at fal.
+func TestVideoMediaFieldShapes(t *testing.T) {
+	in1 := media.Input{Data: []byte("a")}
+	in2 := media.Input{Data: []byte("b")}
+	r := media.VideoRequest{Prompt: "p", References: []media.Input{in1, in2},
+		Videos: []media.Input{in1, in2}, Audios: []media.Input{in1}}
+
+	short := buildVideoInput(r, parseOpts(nil), "some/image-to-video")
+	for _, k := range []string{"video_url", "audio_url"} {
+		if _, ok := short[k].(string); !ok {
+			t.Fatalf("%s must be a string on non-reference endpoints, got %T", k, short[k])
+		}
+	}
+	if v, ok := short["image_urls"].([]string); !ok || len(v) != 2 {
+		t.Fatalf("image_urls: %#v", short["image_urls"])
+	}
+
+	ref := buildVideoInput(r, parseOpts(nil), "minimax/h3-max/reference-to-video")
+	for k, n := range map[string]int{"reference_image_urls": 2, "reference_video_urls": 2, "reference_audio_urls": 1} {
+		if v, ok := ref[k].([]string); !ok || len(v) != n {
+			t.Fatalf("%s: %#v", k, ref[k])
+		}
+	}
+
+	// The configured upstream_reference is reference-family even without the
+	// reference-to-video suffix.
+	custom := buildVideoInput(r, parseOpts([]byte(`{"upstream_reference":"v/x/reference"}`)), "v/x/reference")
+	if _, ok := custom["reference_image_urls"]; !ok {
+		t.Fatalf("configured reference endpoint: %v", custom)
+	}
+
+	// options.fields still overrides the endpoint-derived name.
+	ov := buildVideoInput(r, parseOpts([]byte(`{"fields":{"references":"imgs"}}`)), "x/reference-to-video")
+	if _, ok := ov["imgs"]; !ok {
+		t.Fatalf("fields override lost: %v", ov)
+	}
+	if _, ok := ov["reference_image_urls"]; ok {
+		t.Fatalf("override must replace, not add: %v", ov)
+	}
+}

@@ -437,11 +437,45 @@ func (h *handler) videoContent(w http.ResponseWriter, r *http.Request) {
 	// Download through the task's bound account proxy when resolvable;
 	// otherwise the global proxy (account/provider may be gone by now).
 	var client *http.Client
-	if res, err := h.taskResolved(r.Context(), t); err == nil {
-		if call, err := h.pool.CallFor(r.Context(), res, t.AccountID); err == nil {
+	var res accounts.Resolved
+	var haveRes bool
+	var call provider.Call
+	var callErr error
+	if r0, err := h.taskResolved(r.Context(), t); err == nil {
+		res, haveRes = r0, true
+		if call, callErr = h.pool.CallFor(r.Context(), res, t.AccountID); callErr == nil {
 			client = call.Stream
 		}
 	}
+
+	// An adapter whose vendor needs authentication for the result fetches the
+	// bytes itself. Muse, for example, gates /jobs/<id>/result behind an API key
+	// that a bare GET would never send.
+	if haveRes {
+		if ad, ok := provider.Get(res.Provider.Type); ok {
+			if fetcher, ok := ad.(provider.VideoFetcher); ok {
+				if callErr != nil {
+					h.failContent(w, r, callErr)
+					return
+				}
+				resp, ferr := fetcher.FetchVideo(r.Context(), call, t.ResultURL, r.Header.Get("Range"))
+				if ferr != nil {
+					h.failContent(w, r, ferr)
+					return
+				}
+				defer resp.Body.Close()
+				for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
+					if v := resp.Header.Get(k); v != "" {
+						w.Header().Set(k, v)
+					}
+				}
+				w.WriteHeader(resp.StatusCode)
+				_, _ = io.Copy(w, resp.Body)
+				return
+			}
+		}
+	}
+
 	if client == nil {
 		client, err = h.pool.StreamForGlobal(r.Context())
 		if err != nil {
@@ -462,6 +496,18 @@ func (h *handler) videoContent(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// failContent reports a download failure while streaming a finished video.
+// A vendor error keeps its class (an expired Muse key is 502 upstream_auth, a
+// missing job 400), instead of being flattened into a generic transport error.
+func (h *handler) failContent(w http.ResponseWriter, r *http.Request, err error) {
+	var ue *media.UpstreamError
+	if errors.As(err, &ue) {
+		httpx.Fail(w, r, ue)
+		return
+	}
+	httpx.Fail(w, r, provider.TransportError(err, false))
 }
 
 func (h *handler) listVideos(w http.ResponseWriter, r *http.Request) {

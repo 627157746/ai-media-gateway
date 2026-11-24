@@ -95,7 +95,7 @@ func newEnv(t *testing.T) *env {
 		t: t, st: st, box: box, key: key,
 		srv: server.New(server.Deps{
 			Config: cfg, Store: st, Pool: pool,
-			Admin: admin.New(st, box, netproxy.NewClients(0)), OpenAI: openai.New(st, pool),
+			Admin: admin.New(st, box, netproxy.NewClients(0), filepath.Join(t.TempDir(), "gateway.db")), OpenAI: openai.New(st, pool, filepath.Join(t.TempDir(), "gateway.db")),
 		}),
 	}
 }
@@ -597,5 +597,201 @@ func TestVideoContentThroughAccountProxy(t *testing.T) {
 	rec := e.do(httptest.NewRequest("GET", "/v1/videos/video_p/content", nil))
 	if rec.Code != 200 || rec.Body.String() != "proxied" || atomic.LoadInt32(&hits) != 1 {
 		t.Fatalf("content: code=%d body=%q hits=%d", rec.Code, rec.Body, hits)
+	}
+}
+
+// speechVoiceCaptured runs one /v1/audio/speech call and returns the voice the
+// adapter actually received (empty string when Speak was never reached).
+func speechVoiceCaptured(t *testing.T, e *env, body map[string]any) (string, media.SpeechRequest) {
+	t.Helper()
+	var seen media.SpeechRequest
+	var called bool
+	fake.speakFn = func(_ provider.Call, r media.SpeechRequest) (*media.Audio, error) {
+		called = true
+		seen = r
+		return &media.Audio{Body: io.NopCloser(strings.NewReader("A")), ContentType: "audio/mpeg"}, nil
+	}
+	e.jsonReq("POST", "/v1/audio/speech", body)
+	if !called {
+		t.Fatalf("Speak was not called for %v", body)
+	}
+	return seen.Voice, seen
+}
+
+// TestSpeechVoiceResolutionOrder locks the three-step contract: 音色库 id wins,
+// then options aliases, then pass-through.
+func TestSpeechVoiceResolutionOrder(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	ctx := context.Background()
+
+	// 1. voice-库 hit: client sends our id, adapter must see the vendor id and
+	//    must not run a second alias remap over it.
+	if err := e.st.CreateVoice(ctx, &store.Voice{
+		ID: "vc_test", Name: "n", ProviderID: "p1", UpstreamID: "vendor-voice-1", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, req := speechVoiceCaptured(t, e, map[string]any{"model": "tts", "input": "hi", "voice": "vc_test"})
+	if got != "vendor-voice-1" {
+		t.Fatalf("voice-库 hit: got %q", got)
+	}
+	if !req.VoiceResolved {
+		t.Fatal("VoiceResolved must be true for a voice-库 hit")
+	}
+
+	// 2. Library miss: the value reaches the adapter untouched with
+	//    VoiceResolved=false, which is what lets the real adapters run their
+	//    own `options.voices` alias mapping (the fake adapter has none).
+	patched := json.RawMessage(`{"voices":{"alloy":"vendor-alloy"}}`)
+	if err := e.st.UpdateModel(ctx, "tts", store.ModelPatch{Options: &patched}); err != nil {
+		t.Fatalf("patch model: %v", err)
+	}
+	got, req = speechVoiceCaptured(t, e, map[string]any{"model": "tts", "input": "hi", "voice": "alloy"})
+	if got != "alloy" {
+		t.Fatalf("library miss must pass the raw voice through, got %q", got)
+	}
+	if req.VoiceResolved {
+		t.Fatal("VoiceResolved must be false when the alias path is used")
+	}
+
+	// 3. Nothing configured: pass through untouched.
+	got, _ = speechVoiceCaptured(t, e, map[string]any{"model": "tts", "input": "hi", "voice": "unknown-x"})
+	if got != "unknown-x" {
+		t.Fatalf("pass-through: got %q", got)
+	}
+}
+
+// TestSpeechVoiceResolvedSkipsAlias guards against double mapping: a voice id
+// coming from the library must never be re-mapped by options aliases.
+func TestSpeechVoiceResolvedSkipsAlias(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	ctx := context.Background()
+	patched := json.RawMessage(`{"voices":{"vendor-voice-2":"should-not-be-used"}}`)
+	if err := e.st.UpdateModel(ctx, "tts", store.ModelPatch{Options: &patched}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.CreateVoice(ctx, &store.Voice{
+		ID: "vc_two", Name: "n", ProviderID: "p1", UpstreamID: "vendor-voice-2", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := speechVoiceCaptured(t, e, map[string]any{"model": "tts", "input": "hi", "voice": "vc_two"})
+	if got != "vendor-voice-2" {
+		t.Fatalf("double mapping happened: got %q", got)
+	}
+}
+
+// TestListVoicesEndpoint checks /v1/audio/voices filters disabled entries and
+// never exposes upstream_id.
+func TestListVoicesEndpoint(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	ctx := context.Background()
+	if err := e.st.CreateVoice(ctx, &store.Voice{ID: "vc_on", Name: "启用音色", ProviderID: "p1", UpstreamID: "vendor-on", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.CreateVoice(ctx, &store.Voice{ID: "vc_off", Name: "停用音色", ProviderID: "p1", UpstreamID: "vendor-off", Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	rec := e.do(httptest.NewRequest("GET", "/v1/audio/voices", nil))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Object string           `json:"object"`
+		Data   []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Object != "list" || len(out.Data) != 1 || out.Data[0]["id"] != "vc_on" {
+		t.Fatalf("data: %+v", out.Data)
+	}
+	if _, leaked := out.Data[0]["upstream_id"]; leaked {
+		t.Fatal("upstream_id must not be exposed to clients")
+	}
+	if strings.Contains(rec.Body.String(), "vendor-on") {
+		t.Fatal("vendor voice id leaked in response body")
+	}
+}
+
+// TestListVoicesFiltersByModel verifies ?model= narrows the list to that
+// model's provider, and falls back to the full list when the model is unknown.
+func TestListVoicesFiltersByModel(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.st.CreateProvider(ctx, &store.Provider{ID: "p1", Type: "fakeall", Enabled: true})
+	e.st.CreateProvider(ctx, &store.Provider{ID: "p2", Type: "fakeall", Enabled: true})
+	e.st.CreateModel(ctx, &store.Model{ID: "tts1", ProviderID: "p1", Kind: media.KindSpeech, Upstream: "u1", Enabled: true})
+	e.st.CreateModel(ctx, &store.Model{ID: "tts2", ProviderID: "p2", Kind: media.KindSpeech, Upstream: "u2", Enabled: true})
+	e.st.CreateVoice(ctx, &store.Voice{ID: "vc_a", Name: "A", ProviderID: "p1", UpstreamID: "ua", Enabled: true})
+	e.st.CreateVoice(ctx, &store.Voice{ID: "vc_b", Name: "B", ProviderID: "p2", UpstreamID: "ub", Enabled: true})
+
+	names := func(path string) []string {
+		rec := e.do(httptest.NewRequest("GET", path, nil))
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
+		}
+		var out struct {
+			Data []map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, d := range out.Data {
+			got = append(got, d["id"].(string))
+		}
+		return got
+	}
+
+	if got := names("/v1/audio/voices"); len(got) != 2 {
+		t.Fatalf("unfiltered: %v", got)
+	}
+	if got := names("/v1/audio/voices?model=tts1"); len(got) != 1 || got[0] != "vc_a" {
+		t.Fatalf("tts1: %v", got)
+	}
+	if got := names("/v1/audio/voices?model=tts2"); len(got) != 1 || got[0] != "vc_b" {
+		t.Fatalf("tts2: %v", got)
+	}
+	// An unknown model must not empty the list: clients often ask before the
+	// model is configured.
+	if got := names("/v1/audio/voices?model=ghost"); len(got) != 2 {
+		t.Fatalf("unknown model should fall back to all: %v", got)
+	}
+}
+
+// TestSpeechVoiceWrongProvider checks a voice paired with a model from another
+// provider fails with an explanatory 400 instead of forwarding the id upstream.
+func TestSpeechVoiceWrongProvider(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.st.CreateProvider(ctx, &store.Provider{ID: "p1", Type: "fakeall", Enabled: true})
+	e.st.CreateProvider(ctx, &store.Provider{ID: "p2", Type: "fakeall", Enabled: true})
+	e.account(t, "acc-x", "p1", "key-X")
+	e.st.CreateModel(ctx, &store.Model{ID: "tts", ProviderID: "p1", Kind: media.KindSpeech, Upstream: "up/tts", Enabled: true})
+	e.st.CreateVoice(ctx, &store.Voice{ID: "vc_foreign", Name: "别家音色", ProviderID: "p2", UpstreamID: "vendor-f", Enabled: true})
+
+	var spoken bool
+	fake.speakFn = func(_ provider.Call, _ media.SpeechRequest) (*media.Audio, error) {
+		spoken = true
+		return &media.Audio{Body: io.NopCloser(strings.NewReader("A")), ContentType: "audio/mpeg"}, nil
+	}
+	rec := e.jsonReq("POST", "/v1/audio/speech", map[string]any{"model": "tts", "input": "hi", "voice": "vc_foreign"})
+	if rec.Code != 400 {
+		t.Fatalf("want 400, got %d %s", rec.Code, rec.Body)
+	}
+	if spoken {
+		t.Fatal("a cross-provider voice must be rejected before reaching the adapter")
+	}
+	if !strings.Contains(rec.Body.String(), "p2") || !strings.Contains(rec.Body.String(), "p1") {
+		t.Fatalf("error should name both providers: %s", rec.Body)
+	}
+
+	// A deleted/unknown vc_ id is also a 400, not an upstream call.
+	if rec := e.jsonReq("POST", "/v1/audio/speech", map[string]any{"model": "tts", "input": "hi", "voice": "vc_ghost"}); rec.Code != 400 || !strings.Contains(rec.Body.String(), "不存在") {
+		t.Fatalf("ghost: %d %s", rec.Code, rec.Body)
 	}
 }

@@ -51,6 +51,8 @@ func WriteError(w http.ResponseWriter, err error) {
 		Error(w, http.StatusNotFound, err.Error(), "not_found", "not_found")
 	case errors.Is(err, store.ErrConflict):
 		Error(w, http.StatusConflict, err.Error(), "conflict", "conflict")
+	case isConflict(err):
+		Error(w, http.StatusConflict, err.Error(), "conflict", "conflict")
 	case errors.As(err, &ue):
 		writeUpstreamError(w, ue)
 	default:
@@ -94,6 +96,24 @@ func writeUpstreamError(w http.ResponseWriter, ue *media.UpstreamError) {
 // BadRequest builds a 400-mappable validation error.
 func BadRequest(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", media.ErrBadRequest, fmt.Sprintf(format, args...))
+}
+
+// ConflictError marks a 409 with a caller-supplied, user-facing message. It is
+// distinct from store.ErrConflict so handlers can explain what actually
+// collided instead of surfacing "store: conflict".
+type ConflictError struct{ msg string }
+
+func (e *ConflictError) Error() string { return e.msg }
+
+// Conflict builds a 409-mappable error with a human-readable reason.
+func Conflict(format string, args ...any) error {
+	return &ConflictError{msg: fmt.Sprintf(format, args...)}
+}
+
+// isConflict reports whether err carries a caller-supplied 409 message.
+func isConflict(err error) bool {
+	var ce *ConflictError
+	return errors.As(err, &ce)
 }
 
 // ---- request log entry in context ----

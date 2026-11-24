@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 
 	"ai-media-gateway/internal/accounts"
 	"ai-media-gateway/internal/httpx"
 	"ai-media-gateway/internal/media"
 	"ai-media-gateway/internal/provider"
+	"ai-media-gateway/internal/store"
 )
 
 type speechJSONIn struct {
@@ -19,6 +21,7 @@ type speechJSONIn struct {
 	ResponseFormat string         `json:"response_format"`
 	Speed          float64        `json:"speed"`
 	Instructions   string         `json:"instructions"`
+	Language       string         `json:"language"`
 	Extra          map[string]any `json:"extra"`
 }
 
@@ -36,21 +39,60 @@ func (h *handler) speech(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, bad("input is required"))
 		return
 	}
-	sreq := media.SpeechRequest{
-		Input:        in.Input,
-		Voice:        in.Voice,
-		Format:       in.ResponseFormat,
-		Instructions: in.Instructions,
-		Speed:        in.Speed,
-		Extra:        in.Extra,
-	}
-	logParams(r, speechParams(sreq))
 	res, err := accounts.Resolve(r.Context(), h.st, in.Model, media.KindSpeech)
 	logFill(r, in.Model, &res, nil)
 	if err != nil {
 		httpx.Fail(w, r, err)
 		return
 	}
+
+	// Resolve a 音色库 id to the vendor voice id. Must happen after Resolve
+	// (we need the provider) and before Pool.Do (the request carried to the
+	// adapter must hold the final id). VoiceResolved stops the adapters from
+	// running ResolveVoice over an already-mapped id.
+	voiceResolved := false
+	var refAudio *media.Input
+	if in.Voice != "" {
+		v, err := h.st.FindVoice(r.Context(), res.Provider.ID, in.Voice)
+		if err != nil {
+			httpx.Fail(w, r, err)
+			return
+		}
+		switch {
+		case v == nil && strings.HasPrefix(in.Voice, "vc_"):
+			// A vc_* id that does not resolve for this provider is almost always a
+			// voice from another platform's library. Saying so beats forwarding the
+			// id upstream, where it surfaces as an opaque "Reference not found".
+			httpx.Fail(w, r, h.voiceWrongProvider(r.Context(), res.Provider.ID, in.Voice))
+			return
+		case v != nil && v.Kind == store.KindSample:
+			// Zero-shot cloning: load the stored sample and let the adapter embed
+			// it. The id is not forwarded upstream at all.
+			sample, err := h.readVoiceSample(v.UpstreamID)
+			if err != nil {
+				httpx.Fail(w, r, bad("音色 %q 的参考音频不可用：%v", v.Name, err))
+				return
+			}
+			refAudio = sample
+			in.Voice = ""
+			voiceResolved = true
+		case v != nil:
+			in.Voice = v.UpstreamID
+			voiceResolved = true
+		}
+	}
+
+	sreq := media.SpeechRequest{
+		Input:          in.Input,
+		Voice:          in.Voice,
+		VoiceResolved:  voiceResolved,
+		Format:         in.ResponseFormat,
+		Instructions:   in.Instructions,
+		Speed:          in.Speed,
+		Extra:          in.Extra,
+		ReferenceAudio: refAudio,
+	}
+	logParams(r, speechParams(sreq))
 	ad, err := adapter(res, "speech")
 	if err != nil {
 		httpx.Fail(w, r, err)

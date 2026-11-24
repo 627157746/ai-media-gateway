@@ -1,8 +1,10 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -47,7 +49,7 @@ func newEnv(t *testing.T) *env {
 	pool := accounts.New(st, box, config.Cooldowns{}, netproxy.NewClients(0), nil)
 	e.srv = server.New(server.Deps{
 		Config: cfg, Store: st, Pool: pool,
-		Admin: New(st, box, netproxy.NewClients(0)), OpenAI: openai.New(st, pool),
+		Admin: New(st, box, netproxy.NewClients(0), filepath.Join(t.TempDir(), "gateway.db")), OpenAI: openai.New(st, pool, filepath.Join(t.TempDir(), "gateway.db")),
 	})
 	return e
 }
@@ -636,5 +638,148 @@ func TestProxyPool(t *testing.T) {
 	e.do("PATCH", "/admin/accounts/"+accs.Accounts[0].ID, `{"proxy_url":""}`)
 	if rec := e.do("DELETE", "/admin/proxies/"+px.ID, ""); rec.Code != 204 {
 		t.Fatalf("delete: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestVoicesAdminCRUD(t *testing.T) {
+	e := newEnv(t)
+	if rec := e.do("POST", "/admin/providers", `{"id":"p1","type":"fake"}`); rec.Code != 201 {
+		t.Fatalf("provider: %d %s", rec.Code, rec.Body)
+	}
+	ctx := context.Background()
+
+	// create
+	rec := e.do("POST", "/admin/voices", `{"name":"中文旁白","provider_id":"p1","upstream_id":"up-1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	var created struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		UpstreamID string `json:"upstream_id"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &created)
+	if created.Name != "中文旁白" || created.UpstreamID != "up-1" || created.ID == "" {
+		t.Fatalf("created: %+v", created)
+	}
+
+	// duplicate (provider_id, upstream_id) → 409
+	if rec := e.do("POST", "/admin/voices", `{"name":"dup","provider_id":"p1","upstream_id":"up-1"}`); rec.Code != 409 {
+		t.Fatalf("dup: %d %s", rec.Code, rec.Body)
+	}
+
+	// validation → 400
+	for name, body := range map[string]string{
+		"empty name":       `{"name":"","provider_id":"p1","upstream_id":"x"}`,
+		"empty upstream":   `{"name":"n","provider_id":"p1","upstream_id":""}`,
+		"missing provider": `{"name":"n","provider_id":"","upstream_id":"x"}`,
+		"unknown provider": `{"name":"n","provider_id":"nope","upstream_id":"x"}`,
+		"bad id":           `{"id":"BAD","name":"n","provider_id":"p1","upstream_id":"x"}`,
+	} {
+		if rec := e.do("POST", "/admin/voices", body); rec.Code != 400 {
+			t.Fatalf("%s: %d %s", name, rec.Code, rec.Body)
+		}
+	}
+
+	// patch
+	if rec := e.do("PATCH", "/admin/voices/"+created.ID, `{"name":"新名字","enabled":false}`); rec.Code != 200 {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body)
+	}
+	v, err := e.st.GetVoice(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Name != "新名字" || v.Enabled {
+		t.Fatalf("after patch: %+v", v)
+	}
+
+	// unknown id
+	if rec := e.do("PATCH", "/admin/voices/vc_ghost", `{"name":"x"}`); rec.Code != 404 {
+		t.Fatalf("patch ghost: %d", rec.Code)
+	}
+	if rec := e.do("DELETE", "/admin/voices/vc_ghost", ""); rec.Code != 404 {
+		t.Fatalf("delete ghost: %d", rec.Code)
+	}
+
+	// list filter
+	if rec := e.do("GET", "/admin/voices?provider_id=p1", ""); rec.Code != 200 {
+		t.Fatalf("list: %d", rec.Code)
+	} else {
+		var out struct {
+			Voices []map[string]any `json:"voices"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &out)
+		if len(out.Voices) != 1 {
+			t.Fatalf("list len: %d", len(out.Voices))
+		}
+	}
+
+	// delete
+	if rec := e.do("DELETE", "/admin/voices/"+created.ID, ""); rec.Code != 204 {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+}
+
+// TestUpstreamVoicesUnsupported checks adapters without a voice library (fal)
+// answer an explicit 400 rather than an empty list.
+func TestUpstreamVoicesUnsupported(t *testing.T) {
+	e := newEnv(t)
+	if rec := e.do("POST", "/admin/providers", `{"id":"fal","type":"fal"}`); rec.Code != 201 {
+		t.Fatalf("provider: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("GET", "/admin/providers/fal/upstream-voices", ""); rec.Code != 400 {
+		t.Fatalf("fal: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// TestCloneVoiceValidation covers the clone endpoint's input guards. The
+// happy paths need a real vendor, so only the rejections are unit-tested here;
+// both live paths were verified against the real APIs manually.
+func TestCloneVoiceValidation(t *testing.T) {
+	e := newEnv(t)
+	if rec := e.do("POST", "/admin/providers", `{"id":"p1","type":"fake"}`); rec.Code != 201 {
+		t.Fatalf("provider: %d %s", rec.Code, rec.Body)
+	}
+
+	post := func(fields map[string]string) *httptest.ResponseRecorder {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		for k, v := range fields {
+			mw.WriteField(k, v)
+		}
+		mw.Close()
+		req := httptest.NewRequest("POST", "/admin/voices/clone", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Header.Set("Authorization", "Bearer adm")
+		rec := httptest.NewRecorder()
+		e.srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Missing required fields.
+	if rec := post(map[string]string{"name": "x"}); rec.Code != 400 {
+		t.Fatalf("missing provider_id: %d %s", rec.Code, rec.Body)
+	}
+	if rec := post(map[string]string{"provider_id": "p1"}); rec.Code != 400 {
+		t.Fatalf("missing name: %d %s", rec.Code, rec.Body)
+	}
+	// No sample uploaded.
+	if rec := post(map[string]string{"provider_id": "p1", "name": "x"}); rec.Code != 400 {
+		t.Fatalf("no sample: %d %s", rec.Code, rec.Body)
+	}
+	// Unknown provider.
+	if rec := post(map[string]string{"provider_id": "nope", "name": "x"}); rec.Code != 400 {
+		t.Fatalf("unknown provider: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// TestVoiceSamplePathTraversal ensures a tampered upstream_id cannot read
+// arbitrary files: the sample reader confines paths to the voices directory.
+func TestVoiceSamplePathTraversal(t *testing.T) {
+	h := &handler{dbPath: filepath.Join(t.TempDir(), "gateway.db")}
+	for _, bad := range []string{"../../etc/passwd", "../gateway.db", "/etc/passwd"} {
+		if _, err := h.readVoiceSample(bad); err == nil {
+			t.Fatalf("path %q should be rejected", bad)
+		}
 	}
 }

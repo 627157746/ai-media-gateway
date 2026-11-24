@@ -140,13 +140,78 @@ type TaskState struct {
 	Error    string
 }
 
+// VoiceMode says how a speech model consumes the `voice` field, so clients can
+// render the right control instead of offering a voice library where it does
+// not apply.
+type VoiceMode string
+
+const (
+	// VoiceModePreset: voice is a vendor preset name (MiMo 冰糖, HeyGen ids).
+	// A voice-library id is meaningless here.
+	VoiceModePreset VoiceMode = "preset"
+	// VoiceModeLibrary: voice is a 音色库 entry, mapped to a vendor id.
+	VoiceModeLibrary VoiceMode = "library"
+	// VoiceModeSample: voice must be a reference sample (zero-shot cloning).
+	VoiceModeSample VoiceMode = "sample"
+	// VoiceModePrompt: voice is a free-text timbre description, not an id.
+	VoiceModePrompt VoiceMode = "prompt"
+	// VoiceModeNone: the model ignores voice entirely.
+	VoiceModeNone VoiceMode = "none"
+)
+
+// VoiceSpec is the model-level voice declaration read from options.
+type VoiceSpec struct {
+	Mode VoiceMode `json:"voice_mode"`
+	// Presets lists the vendor preset names a `preset` model accepts, so the UI
+	// can offer a dropdown instead of asking the user to type a magic string.
+	Presets []string `json:"voice_presets,omitempty"`
+	// DefaultPreset is what the vendor uses when no voice is sent.
+	DefaultPreset string `json:"voice_default,omitempty"`
+}
+
+// VoiceSpecFromOptions reads the voice declaration from model options.
+// An unannotated model defaults to library: the gateway's own voice library is
+// the safest assumption because unresolved ids fail loudly rather than
+// silently changing the timbre.
+func VoiceSpecFromOptions(opts []byte) VoiceSpec {
+	spec := VoiceSpec{Mode: VoiceModeLibrary}
+	if len(opts) == 0 {
+		return spec
+	}
+	var o struct {
+		Mode    VoiceMode `json:"voice_mode"`
+		Presets []string  `json:"voice_presets"`
+		Default string    `json:"voice_default"`
+	}
+	if json.Unmarshal(opts, &o) != nil {
+		return spec
+	}
+	if o.Mode != "" {
+		spec.Mode = o.Mode
+	}
+	spec.Presets = o.Presets
+	spec.DefaultPreset = o.Default
+	return spec
+}
+
+// VoiceModeFromOptions keeps the older call sites working.
+func VoiceModeFromOptions(opts []byte) VoiceMode {
+	return VoiceSpecFromOptions(opts).Mode
+}
+
 type SpeechRequest struct {
-	Input        string
-	Voice        string
-	Format       string
-	Instructions string
-	Speed        float64
-	Extra        map[string]any
+	Input         string
+	Voice         string
+	VoiceResolved bool // Voice is already a vendor id; adapters must not remap it
+	Format        string
+	Instructions  string
+	Language      string
+	Speed         float64
+	Extra         map[string]any
+	// ReferenceAudio carries the sample for zero-shot cloning (Fish Audio). nil
+	// means plain reference_id synthesis; when set, adapters that support
+	// cloning embed the audio in the request instead of sending a voice id.
+	ReferenceAudio *Input
 }
 
 type Audio struct {

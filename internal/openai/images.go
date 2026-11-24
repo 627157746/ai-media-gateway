@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"ai-media-gateway/internal/accounts"
+	"ai-media-gateway/internal/capability"
 	"ai-media-gateway/internal/httpx"
 	"ai-media-gateway/internal/media"
 	"ai-media-gateway/internal/provider"
@@ -239,13 +240,36 @@ func (h *handler) listModels(w http.ResponseWriter, r *http.Request) {
 		if err != nil || !prov.Enabled {
 			continue
 		}
-		data = append(data, map[string]any{
+		entry := map[string]any{
 			"id":       m.ID,
 			"object":   "model",
 			"created":  m.CreatedAt.Unix(),
 			"owned_by": m.ProviderID,
 			"kind":     string(m.Kind),
-		})
+		}
+		// Declare what the model accepts so clients can render the right inputs
+		// without hardcoding per-provider rules.
+		switch m.Kind {
+		case media.KindImage:
+			// Prefer the vendor's own endpoint schema; it is the only source that
+			// stays correct as models are added, since each endpoint has its own
+			// parameters. The hand-declared table is the fallback.
+			entry["capabilities"] = capability.ImageFromSchemaForKinds(
+				h.imageSchema(r.Context(), m, prov),
+				prov.Type, m.Upstream, m.Options)
+		case media.KindVideo:
+			// Video capabilities come from the endpoint schema when the vendor
+			// publishes one, because the two modes (first-frame animation vs
+			// identity/style references) live on different endpoints.
+			var vs provider.EndpointSchema
+			if raw := h.videoSchema(r.Context(), m, prov); raw != nil {
+				vs = *raw
+			}
+			entry["capabilities"] = capability.VideoFromSchema(vs, prov.Type, m.Upstream, m.Options)
+		case media.KindSpeech:
+			entry["capabilities"] = capability.FromOptions(prov.Type, m.Options)
+		}
+		data = append(data, entry)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }

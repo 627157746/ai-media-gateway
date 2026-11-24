@@ -1,0 +1,7 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "新增 007 迁移与 voices 表：迁移命名/JSON options 扫描/ErrConflict 约定/时间列 unix-ms"}
+{"file": ".trellis/spec/backend/provider-adapters.md", "reason": "音色解析优先级（ResolveVoice 三级链）与三个 TTS 适配器对 voice/format 的处理差异"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "依赖方向：provider 不能 import store，音色库查询必须落在 openai 层；register 约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "400/404/409 的映射来源 httpx.WriteError 与 UpstreamError 分类"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "新增管理页 voices.js 的写法范式（h/openSheet/sheetButtons/toast）"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "admin 端点与上游调用不得泄漏 key，沿用 scrubKey"}

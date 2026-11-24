@@ -114,12 +114,14 @@ func (s *Store) UpdateProvider(ctx context.Context, id string, p ProviderPatch) 
 	return oneRow(res, err)
 }
 
-// DeleteProvider refuses (ErrConflict) while accounts or models reference it.
+// DeleteProvider refuses (ErrConflict) while accounts, models or voices
+// reference it.
 func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 	var children int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT (SELECT COUNT(*) FROM accounts WHERE provider_id=?) +
-		        (SELECT COUNT(*) FROM models WHERE provider_id=?)`, id, id).Scan(&children)
+		        (SELECT COUNT(*) FROM models WHERE provider_id=?) +
+		        (SELECT COUNT(*) FROM voices WHERE provider_id=?)`, id, id, id).Scan(&children)
 	if err != nil {
 		return err
 	}

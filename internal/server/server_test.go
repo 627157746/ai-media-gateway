@@ -51,7 +51,7 @@ func newEnv(t *testing.T) *env {
 		st: st,
 		srv: server.New(server.Deps{
 			Config: cfg, Store: st, Pool: pool,
-			Admin: admin.New(st, box, netproxy.NewClients(0)), OpenAI: openai.New(st, pool), Web: web.Handler(),
+			Admin: admin.New(st, box, netproxy.NewClients(0), filepath.Join(t.TempDir(), "gateway.db")), OpenAI: openai.New(st, pool, filepath.Join(t.TempDir(), "gateway.db")), Web: web.Handler(),
 		}),
 		key: plain,
 	}
