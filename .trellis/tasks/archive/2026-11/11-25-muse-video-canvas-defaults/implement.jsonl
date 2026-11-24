@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/provider-adapters.md", "reason": "muse 视频适配器约定与可选接口模式（VideoFetcher 等）"}
+{"file": ".trellis/spec/backend/openai-api.md", "reason": "/v1/videos 处理流程与字段解析约定"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "request_logs.params 结构；适配器不写日志的约束"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "UpstreamError 分类，确认去掉 ClassInvalid 拒收后其余校验不受影响"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "改动跨 provider 与 openai 两层"}
