@@ -152,7 +152,7 @@ async function providerSheet(existing, reload) {
           }
           close(); toast('已保存', 'ok'); reload();
         } catch (e) { err.textContent = errMsg(e); }
-      }, close)));
+      }, () => close())));
 }
 
 function accountSheet(p, existing, reload) {
@@ -199,5 +199,5 @@ function accountSheet(p, existing, reload) {
           }
           close(); toast('已保存', 'ok'); reload();
         } catch (e) { err.textContent = errMsg(e); }
-      }, close)));
+      }, () => close())));
 }

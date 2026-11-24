@@ -17,6 +17,10 @@ import (
 
 var idRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 
+// modelIDRE also allows dots (e.g. seedance-2.5) but not a leading one, so
+// "." / ".." can never become a path segment under /admin/models/.
+var modelIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*$`)
+
 type handler struct {
 	st  *store.Store
 	box *secret.Box
@@ -425,8 +429,8 @@ func (h *handler) createModel(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &in) {
 		return
 	}
-	if !validID(in.ID) {
-		fail(w, bad("model id required and must match [a-z0-9-]+"))
+	if !modelIDRE.MatchString(in.ID) {
+		fail(w, bad("model id required and must match [a-z0-9][a-z0-9.-]*"))
 		return
 	}
 	if in.ProviderID == "" {

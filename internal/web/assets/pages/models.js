@@ -159,7 +159,7 @@ function modelSheet(existing, providers, reload) {
           }
           close(); toast('已保存', 'ok'); reload();
         } catch (e) { err.textContent = errMsg(e); }
-      }, close)));
+      }, () => close())));
 }
 
 function mergeOpts(curText, tpl) {

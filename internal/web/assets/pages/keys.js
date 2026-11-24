@@ -58,7 +58,7 @@ function createSheet(reload) {
           close();
           showKeyOnce(k, reload);
         } catch (e) { err.textContent = errMsg(e); }
-      }, close)));
+      }, () => close())));
 }
 
 function showKeyOnce(k, reload) {
@@ -66,13 +66,15 @@ function showKeyOnce(k, reload) {
     class: 'btn', text: '用于试用',
     onclick: () => { saveGwKey(k.key); toast('已保存为试用密钥', 'ok'); },
   });
-  modalDialog('密钥已创建 — 仅显示这一次，请立即保存',
+  const close = modalDialog('密钥已创建 — 仅显示这一次，请立即保存',
     h('div', null,
       h('div', { class: 'muted', text: `${k.name || k.id}:` }),
       h('div', { class: 'key-show', text: k.key }),
       h('div', { class: 'row start' },
         h('button', { class: 'btn primary', text: '复制', onclick: () => copyText(k.key) }),
         useBtn,
-        h('span', { class: 'muted fs12 self-c', text: '「用于试用」会把此密钥填入试用页面' }))));
+        h('span', { class: 'muted fs12 self-c', text: '「用于试用」会把此密钥填入试用页面' }),
+        h('span', { class: 'spacer' }),
+        h('button', { class: 'btn', text: '关闭', onclick: () => close() }))));
   reload();
 }

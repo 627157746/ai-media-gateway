@@ -120,6 +120,17 @@ func TestProviderAccountModelFlow(t *testing.T) {
 	if rec := e.do("POST", "/admin/models", `{"id":"x-1","provider_id":"ghost","kind":"image"}`); rec.Code != 400 {
 		t.Fatalf("bad provider: %d", rec.Code)
 	}
+	if rec := e.do("POST", "/admin/models", `{"id":"seedance-2.5","provider_id":"p1","kind":"video"}`); rec.Code != 201 {
+		t.Fatalf("dotted model id: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("DELETE", "/admin/models/seedance-2.5", ""); rec.Code != 204 {
+		t.Fatalf("delete dotted model: %d", rec.Code)
+	}
+	for _, id := range []string{".", "..", ".x", "a/b", "A-1"} {
+		if rec := e.do("POST", "/admin/models", `{"id":"`+id+`","provider_id":"p1","kind":"image"}`); rec.Code != 400 {
+			t.Fatalf("model id %q: %d", id, rec.Code)
+		}
+	}
 
 	// /v1/models requires gateway key — create one and check listing
 	_, plain, err := e.st.CreateAPIKey(context.Background(), "canvas")
