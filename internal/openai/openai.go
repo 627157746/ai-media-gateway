@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"ai-media-gateway/internal/accounts"
 	"ai-media-gateway/internal/httpx"
@@ -19,15 +20,14 @@ import (
 )
 
 type handler struct {
-	st     *store.Store
-	pool   *accounts.Pool
-	now    func() time.Time
-	stream *http.Client
+	st   *store.Store
+	pool *accounts.Pool
+	now  func() time.Time
 }
 
 // New returns the /v1 handler (mounted behind gateway auth by server).
 func New(st *store.Store, pool *accounts.Pool) http.Handler {
-	h := &handler{st: st, pool: pool, now: time.Now, stream: &http.Client{}}
+	h := &handler{st: st, pool: pool, now: time.Now}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /v1/models", h.listModels)
 	m.HandleFunc("POST /v1/images/generations", h.generateImage)
@@ -78,6 +78,171 @@ func logFill(r *http.Request, modelID string, res *accounts.Resolved, result *ac
 		l.AccountID = result.AccountID
 		l.Attempts = result.Attempts
 	}
+}
+
+// logParams stores a normalized summary of the request's media parameters
+// on the log entry (nil-safe). Media inputs are summarized — never bytes.
+func logParams(r *http.Request, p map[string]any) {
+	l := httpx.Log(r.Context())
+	if l == nil || len(p) == 0 {
+		return
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return
+	}
+	l.Params = b
+}
+
+func clipRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n]) + "…"
+}
+
+func putStr(p map[string]any, k, v string) {
+	if v != "" {
+		p[k] = v
+	}
+}
+
+func putNum(p map[string]any, k string, v int) {
+	if v != 0 {
+		p[k] = v
+	}
+}
+
+// inputSummary describes an Input without any of its bytes.
+func inputSummary(in media.Input) map[string]any {
+	m := map[string]any{}
+	if in.URL != "" && !strings.HasPrefix(in.URL, "data:") {
+		m["url"] = clipRunes(in.URL, 200)
+		return m
+	}
+	// bytes, or a data: URL left undecoded — treated like bytes either way.
+	if in.Name != "" {
+		m["name"] = in.Name
+	}
+	if in.MIME != "" {
+		m["mime"] = in.MIME
+	}
+	n := len(in.Data)
+	if n == 0 && in.URL != "" {
+		n = len(in.URL)
+	}
+	if n > 0 {
+		m["bytes"] = n
+	}
+	return m
+}
+
+func inputsSummary(ins []media.Input) []any {
+	out := make([]any, 0, len(ins))
+	for _, in := range ins {
+		out = append(out, inputSummary(in))
+	}
+	return out
+}
+
+// scrubExtra deep-copies a client extra map, eliding strings longer than
+// 500 runes (e.g. base64 blobs) with a placeholder.
+func scrubExtra(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(t))
+		for k, x := range t {
+			m[k] = scrubExtra(x)
+		}
+		return m
+	case []any:
+		s := make([]any, len(t))
+		for i, x := range t {
+			s[i] = scrubExtra(x)
+		}
+		return s
+	case string:
+		if utf8.RuneCountInString(t) > 500 {
+			return fmt.Sprintf("<已省略 %d 字符>", utf8.RuneCountInString(t))
+		}
+		return t
+	default:
+		return v
+	}
+}
+
+func imageParams(req media.ImageRequest) map[string]any {
+	p := map[string]any{}
+	putStr(p, "prompt", clipRunes(req.Prompt, 2000))
+	putNum(p, "n", req.N)
+	putStr(p, "size", req.Size)
+	putStr(p, "quality", req.Quality)
+	putStr(p, "background", req.Background)
+	putStr(p, "resolution", req.Resolution)
+	putStr(p, "response_format", req.ResponseFormat)
+	if req.Edit {
+		p["edit"] = true
+	}
+	if len(req.Images) > 0 {
+		p["images"] = inputsSummary(req.Images)
+	}
+	if req.Mask != nil {
+		p["mask"] = inputSummary(*req.Mask)
+	}
+	if len(req.Extra) > 0 {
+		p["extra"] = scrubExtra(req.Extra)
+	}
+	return p
+}
+
+func videoParams(req media.VideoRequest) map[string]any {
+	p := map[string]any{}
+	putStr(p, "prompt", clipRunes(req.Prompt, 2000))
+	putStr(p, "mode", req.Mode)
+	putStr(p, "seconds", req.Seconds)
+	putStr(p, "size", req.Size)
+	putStr(p, "resolution", req.Resolution)
+	putStr(p, "ratio", req.Ratio)
+	if req.GenerateAudio != nil {
+		p["generate_audio"] = *req.GenerateAudio
+	}
+	if req.Watermark != nil {
+		p["watermark"] = *req.Watermark
+	}
+	if req.FirstFrame != nil {
+		p["first_frame"] = inputSummary(*req.FirstFrame)
+	}
+	if req.LastFrame != nil {
+		p["last_frame"] = inputSummary(*req.LastFrame)
+	}
+	if len(req.References) > 0 {
+		p["references"] = inputsSummary(req.References)
+	}
+	if len(req.Videos) > 0 {
+		p["videos"] = inputsSummary(req.Videos)
+	}
+	if len(req.Audios) > 0 {
+		p["audios"] = inputsSummary(req.Audios)
+	}
+	if len(req.Extra) > 0 {
+		p["extra"] = scrubExtra(req.Extra)
+	}
+	return p
+}
+
+func speechParams(req media.SpeechRequest) map[string]any {
+	p := map[string]any{}
+	putStr(p, "input", clipRunes(req.Input, 2000))
+	putStr(p, "voice", req.Voice)
+	putStr(p, "format", req.Format)
+	putStr(p, "instructions", clipRunes(req.Instructions, 2000))
+	if req.Speed > 0 {
+		p["speed"] = req.Speed
+	}
+	if len(req.Extra) > 0 {
+		p["extra"] = scrubExtra(req.Extra)
+	}
+	return p
 }
 
 // ---- input parsing helpers ----

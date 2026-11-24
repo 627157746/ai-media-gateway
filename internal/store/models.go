@@ -90,6 +90,7 @@ func (s *Store) CreateModel(ctx context.Context, m *Model) error {
 }
 
 type ModelPatch struct {
+	ID         *string
 	ProviderID *string
 	Kind       *media.Kind
 	Upstream   *string
@@ -103,6 +104,10 @@ func (s *Store) UpdateModel(ctx context.Context, id string, p ModelPatch) error 
 	add := func(col string, v any) {
 		sets = append(sets, col+"=?")
 		args = append(args, v)
+	}
+	rename := p.ID != nil && *p.ID != id
+	if rename {
+		add("id", *p.ID)
 	}
 	if p.ProviderID != nil {
 		add("provider_id", *p.ProviderID)
@@ -120,9 +125,39 @@ func (s *Store) UpdateModel(ctx context.Context, id string, p ModelPatch) error 
 		add("enabled", *p.Enabled)
 	}
 	args = append(args, id)
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE models SET `+strings.Join(sets, ",")+` WHERE id=?`, args...)
-	return oneRow(res, err)
+	q := `UPDATE models SET ` + strings.Join(sets, ",") + ` WHERE id=?`
+	if !rename {
+		res, err := s.db.ExecContext(ctx, q, args...)
+		return oneRow(res, err)
+	}
+	// video_tasks.model_id holds the id by value (no FK), so the rename and
+	// the task rewrite must commit or roll back together.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	var one int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM models WHERE id=?`, *p.ID).Scan(&one)
+	if err == nil {
+		tx.Rollback()
+		return ErrConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		tx.Rollback()
+		return err
+	}
+	res, err := tx.ExecContext(ctx, q, args...)
+	if err == nil {
+		err = oneRow(res, nil)
+	}
+	if err == nil {
+		_, err = tx.ExecContext(ctx, `UPDATE video_tasks SET model_id=? WHERE model_id=?`, *p.ID, id)
+	}
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) DeleteModel(ctx context.Context, id string) error {

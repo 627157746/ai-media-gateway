@@ -36,6 +36,15 @@ func (h *handler) speech(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, bad("input is required"))
 		return
 	}
+	sreq := media.SpeechRequest{
+		Input:        in.Input,
+		Voice:        in.Voice,
+		Format:       in.ResponseFormat,
+		Instructions: in.Instructions,
+		Speed:        in.Speed,
+		Extra:        in.Extra,
+	}
+	logParams(r, speechParams(sreq))
 	res, err := accounts.Resolve(r.Context(), h.st, in.Model, media.KindSpeech)
 	logFill(r, in.Model, &res, nil)
 	if err != nil {
@@ -48,14 +57,6 @@ func (h *handler) speech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sp := ad.(provider.SpeechGenerator)
-	sreq := media.SpeechRequest{
-		Input:        in.Input,
-		Voice:        in.Voice,
-		Format:       in.ResponseFormat,
-		Instructions: in.Instructions,
-		Speed:        in.Speed,
-		Extra:        in.Extra,
-	}
 	var audio *media.Audio
 	pr, err := h.pool.Do(r.Context(), res, func(ctx context.Context, c provider.Call) error {
 		out, err := sp.Speak(ctx, c, sreq)

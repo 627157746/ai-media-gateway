@@ -62,7 +62,7 @@ func enabledProvider(ctx context.Context, st *store.Store, id, modelID string) (
 }
 
 func providerConfig(p *store.Provider) provider.ProviderConfig {
-	return provider.ProviderConfig{ID: p.ID, Type: p.Type, BaseURL: p.BaseURL, Options: p.Options}
+	return provider.ProviderConfig{ID: p.ID, Type: p.Type, BaseURL: p.BaseURL, ProxyURL: p.ProxyURL, Options: p.Options}
 }
 
 func passthroughOn(opts json.RawMessage) bool {

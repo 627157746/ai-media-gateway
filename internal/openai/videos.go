@@ -260,6 +260,7 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 		vreq.Audios = auds
 	}
 	normalizeMode(&vreq)
+	logParams(r, videoParams(vreq))
 
 	res, err := accounts.Resolve(r.Context(), h.st, in.Model, media.KindVideo)
 	logFill(r, in.Model, &res, nil)
@@ -359,18 +360,10 @@ func (h *handler) pollTask(w http.ResponseWriter, r *http.Request, t *store.Vide
 		httpx.WriteJSON(w, http.StatusOK, videoObject(t))
 	}
 
-	prov, err := h.st.GetProvider(r.Context(), t.ProviderID)
+	res, err := h.taskResolved(r.Context(), t)
 	if err != nil {
 		fail("provider " + t.ProviderID + " was deleted")
 		return
-	}
-	mcfg := provider.ModelConfig{ID: t.ModelID, Kind: media.KindVideo, Upstream: t.ModelID}
-	if m, err := h.st.GetModel(r.Context(), t.ModelID); err == nil {
-		mcfg = provider.ModelConfig{ID: m.ID, Kind: m.Kind, Upstream: m.Upstream, Options: m.Options}
-	}
-	res := accounts.Resolved{
-		Provider: provider.ProviderConfig{ID: prov.ID, Type: prov.Type, BaseURL: prov.BaseURL, Options: prov.Options},
-		Model:    mcfg,
 	}
 	call, err := h.pool.CallFor(r.Context(), res, t.AccountID)
 	if err != nil {
@@ -414,6 +407,23 @@ func (h *handler) pollTask(w http.ResponseWriter, r *http.Request, t *store.Vide
 	httpx.WriteJSON(w, http.StatusOK, videoObject(t))
 }
 
+// taskResolved rebuilds the Resolved for a stored video task — the provider
+// must still exist; the model lookup is best-effort (deleted → upstream=id).
+func (h *handler) taskResolved(ctx context.Context, t *store.VideoTask) (accounts.Resolved, error) {
+	prov, err := h.st.GetProvider(ctx, t.ProviderID)
+	if err != nil {
+		return accounts.Resolved{}, err
+	}
+	mcfg := provider.ModelConfig{ID: t.ModelID, Kind: media.KindVideo, Upstream: t.ModelID}
+	if m, err := h.st.GetModel(ctx, t.ModelID); err == nil {
+		mcfg = provider.ModelConfig{ID: m.ID, Kind: m.Kind, Upstream: m.Upstream, Options: m.Options}
+	}
+	return accounts.Resolved{
+		Provider: provider.ProviderConfig{ID: prov.ID, Type: prov.Type, BaseURL: prov.BaseURL, ProxyURL: prov.ProxyURL, Options: prov.Options},
+		Model:    mcfg,
+	}, nil
+}
+
 func (h *handler) videoContent(w http.ResponseWriter, r *http.Request) {
 	t, err := h.st.GetVideoTask(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -424,7 +434,22 @@ func (h *handler) videoContent(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusConflict, "video is not ready", "invalid_request_error", "video_not_ready")
 		return
 	}
-	resp, err := provider.FetchURL(r.Context(), h.stream, t.ResultURL, r.Header.Get("Range"))
+	// Download through the task's bound account proxy when resolvable;
+	// otherwise the global proxy (account/provider may be gone by now).
+	var client *http.Client
+	if res, err := h.taskResolved(r.Context(), t); err == nil {
+		if call, err := h.pool.CallFor(r.Context(), res, t.AccountID); err == nil {
+			client = call.Stream
+		}
+	}
+	if client == nil {
+		client, err = h.pool.StreamForGlobal(r.Context())
+		if err != nil {
+			httpx.Fail(w, r, err)
+			return
+		}
+	}
+	resp, err := provider.FetchURL(r.Context(), client, t.ResultURL, r.Header.Get("Range"))
 	if err != nil {
 		httpx.Fail(w, r, provider.TransportError(err, false))
 		return

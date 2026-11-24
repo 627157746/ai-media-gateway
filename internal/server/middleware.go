@@ -60,12 +60,25 @@ func (w *statusWriter) Flush() {
 // Unwrap exposes the underlying writer for http.NewResponseController.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// requestLog emits one slog line per request and records /v1/* calls in
-// request_logs. Authorization headers and bodies are never logged.
+// loggedEndpoint reports whether a request gets a request_logs row: only
+// model-generation calls — listings, polls and downloads are just noise.
+func loggedEndpoint(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	switch r.URL.Path {
+	case "/v1/images/generations", "/v1/images/edits", "/v1/videos", "/v1/audio/speech":
+		return true
+	}
+	return false
+}
+
+// requestLog emits one slog line per request and records generation calls
+// in request_logs. Authorization headers and bodies are never logged.
 func requestLog(st *store.Store, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var entry *store.RequestLog
-		if strings.HasPrefix(r.URL.Path, "/v1/") {
+		if loggedEndpoint(r) {
 			entry = &store.RequestLog{Endpoint: r.Method + " " + r.URL.Path}
 			r = r.WithContext(httpx.WithLog(r.Context(), entry))
 		}
@@ -138,11 +151,17 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-func gatewayAuth(st *store.Store, next http.Handler) http.Handler {
+// gatewayAuth accepts an sk-mg-* gateway key, or the admin token itself
+// (used by the built-in 试用 page, which carries no gateway key).
+func gatewayAuth(st *store.Store, adminToken string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := bearerToken(r)
 		if tok == "" {
 			httpx.Error(w, http.StatusUnauthorized, "missing API key", "invalid_request_error", "invalid_api_key")
+			return
+		}
+		if adminToken != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminToken)) == 1 {
+			next.ServeHTTP(w, r)
 			return
 		}
 		k, err := st.AuthenticateKey(r.Context(), tok)

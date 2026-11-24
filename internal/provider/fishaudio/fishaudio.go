@@ -77,6 +77,28 @@ func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest
 	return &media.Audio{Body: resp.Body, ContentType: ct}, nil
 }
 
+// Fish Audio has no TTS-model list API; this mirrors the `model` header enum.
+var staticModels = []provider.UpstreamModel{
+	{ID: "s2.1-pro", Name: "S2.1 Pro", Kind: media.KindSpeech, Category: "text-to-speech", Description: "推荐"},
+	{ID: "s2.1-pro-free", Name: "S2.1 Pro Free", Kind: media.KindSpeech, Category: "text-to-speech"},
+	{ID: "s3-pro", Name: "S3 Pro", Kind: media.KindSpeech, Category: "text-to-speech"},
+	{ID: "drama-3", Name: "Drama 3", Kind: media.KindSpeech, Category: "text-to-speech"},
+	{ID: "s2-pro", Name: "S2 Pro", Kind: media.KindSpeech, Category: "text-to-speech"},
+	{ID: "s1", Name: "S1", Kind: media.KindSpeech, Category: "text-to-speech", Description: "已弃用，2026-12-31 退役", Deprecated: true},
+}
+
+func (Adapter) ListModels(_ context.Context, _ provider.Call, q provider.ModelQuery) (provider.ModelPage, error) {
+	ql := strings.ToLower(q.Q)
+	out := provider.ModelPage{Models: []provider.UpstreamModel{}}
+	for _, m := range staticModels {
+		if ql != "" && !strings.Contains(strings.ToLower(m.ID), ql) && !strings.Contains(strings.ToLower(m.Name), ql) {
+			continue
+		}
+		out.Models = append(out.Models, m)
+	}
+	return out, nil
+}
+
 func statusError(resp *http.Response) error {
 	body := provider.ReadErrorBody(resp)
 	msg := http.StatusText(resp.StatusCode)

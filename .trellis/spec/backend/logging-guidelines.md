@@ -8,13 +8,14 @@
 
 `internal/server/middleware.go` `requestLog` emits one `slog.Info("request", …)` per request after the handler returns, with fields `request_id`, `method`, `path`, `status`, `latency_ms`. Status comes from `statusWriter` (which also has `Flush` and `Unwrap()` so `http.NewResponseController` works for streaming — keep those when touching the writer).
 
-**Never log**: `Authorization` headers, API keys, request bodies, prompts, or media content. Status codes and upstream *messages* are fine.
+**Never log**: `Authorization` headers, API keys, request bodies, or media content to slog/stdout. Status codes and upstream *messages* are fine. (`request_logs.params` is the documented exception for request params — see below: prompts are truncated and media bytes are never stored.)
 
 ## `request_logs` table rows
 
-- For `/v1/*` paths, the middleware creates a `*store.RequestLog` and puts it in the request ctx via `httpx.WithLog`, then inserts it after the handler returns (endpoint, status, latency filled by middleware).
+- Only model-generation calls get a `request_logs` row: `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/videos`, `POST /v1/audio/speech` (`loggedEndpoint` in middleware). Everything else (model list, task polls, content downloads) still gets the slog line but no row.
 - Handlers fill `ModelID`, `ProviderID`, `AccountID`, `Attempts` through the ctx entry — the shared helper is `logFill` in `internal/openai/openai.go`; get the entry with `httpx.Log(ctx)` (nil-safe outside `/v1/*`).
 - Error responses go through `httpx.Fail(w, r, err)`, which sets `entry.Error` before writing — always prefer `Fail` over bare `WriteError` in handlers so failures appear in `request_logs`.
+- `params` (migration 004): `logParams(r, imageParams|videoParams|speechParams(req))` stores a normalized JSON summary of the parsed media request on generation endpoints — image: prompt/n/size/quality/background/resolution/response_format/edit/images/mask/extra; video: prompt/mode/seconds/size/resolution/ratio/generate_audio/watermark/first_frame/last_frame/references/videos/audios/extra; speech: input/voice/format/instructions/speed/extra. Empty/zero values are omitted; prompt/input/instructions clip at 2000 runes; `media.Input` becomes `{"url"}` / `{"name","mime","bytes"}` — **bytes and base64 are never stored**; `extra` strings >500 runes become `<已省略 N 字符>`. The 请求日志 UI renders it via the 详情 sheet.
 
 ## Levels
 

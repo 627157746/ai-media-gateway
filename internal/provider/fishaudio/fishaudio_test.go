@@ -110,3 +110,28 @@ func TestErrorMapping(t *testing.T) {
 		}
 	}
 }
+
+func TestListModels(t *testing.T) {
+	page, err := Adapter{}.ListModels(context.Background(), provider.Call{}, provider.ModelQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Models) != 6 {
+		t.Fatalf("models: %+v", page.Models)
+	}
+	m0 := page.Models[0]
+	if m0.ID != "s2.1-pro" || m0.Kind != media.KindSpeech || m0.Category != "text-to-speech" {
+		t.Fatalf("first: %+v", m0)
+	}
+	last := page.Models[len(page.Models)-1]
+	if last.ID != "s1" || !last.Deprecated {
+		t.Fatalf("last: %+v", last)
+	}
+	page, err = Adapter{}.ListModels(context.Background(), provider.Call{}, provider.ModelQuery{Q: "s3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Models) != 1 || page.Models[0].ID != "s3-pro" {
+		t.Fatalf("q filter: %+v", page.Models)
+	}
+}

@@ -53,6 +53,10 @@ If every attempt fails with failover-able errors, `Do` returns the **last** `Ups
 
 `Pool.CallFor(ctx, resolved, accountID)` builds a `provider.Call` for one specific account **ignoring** enabled/cooldown — used by video polling (`GET /v1/videos/{id}`) because the task row stores the account that submitted it. Deleted account → error → task marked failed. Polls never fail over.
 
+## Upstream HTTP clients (proxy)
+
+`callFor` sets `call.HTTP`/`call.Stream` from `netproxy.Clients.For(ResolveProxy(ctx, st, Effective(...)))` — account > provider > global, `""` inherits down to `ProxyFromEnvironment`, `"direct"` bypasses, an http/https/socks5/socks5h URL, or a `proxy:<id>` pool reference (`accounts.ResolveProxy` resolves it through `store.GetProxy`; a dangling ref errors 「代理 <id> 已被删除」 — same helper used by admin's upstream-models, `StreamForGlobal`, and `/admin/proxy/test`). `netproxy.NewClients(timeout)` is built once in `main.go` and shared by the pool and `admin` (upstream-models uses the same rule). Adapters must use `c.HTTP`/`c.Stream`, never `http.DefaultClient`.
+
 ## The fail-over window rule
 
 Failover is only safe **before bytes are written to the client and before the task row exists**:

@@ -169,3 +169,35 @@ func TestErrorMapping(t *testing.T) {
 		}
 	}
 }
+
+func TestListModels(t *testing.T) {
+	cap := &captured{respBody: []byte(`[
+		{"model_id":"eleven_multilingual_v2","name":"Eleven Multilingual v2","description":"d1","can_do_text_to_speech":true},
+		{"model_id":"eleven_turbo_v2_5","name":"Eleven Turbo v2.5","can_do_text_to_speech":true},
+		{"model_id":"scribe_v1","name":"Scribe v1","can_do_text_to_speech":false,"can_do_speech_to_text":true}
+	]`)}
+	srv := fakeEL(t, cap)
+	page, err := Adapter{}.ListModels(context.Background(), call(srv, ""), provider.ModelQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap.apiKey != "el-key" || cap.path != "/v1/models" {
+		t.Fatalf("captured: path=%q key=%q", cap.path, cap.apiKey)
+	}
+	if len(page.Models) != 2 { // scribe_v1 is not TTS-capable
+		t.Fatalf("models: %+v", page.Models)
+	}
+	m0 := page.Models[0]
+	if m0.ID != "eleven_multilingual_v2" || m0.Kind != media.KindSpeech ||
+		m0.Category != "text-to-speech" || m0.Description != "d1" || m0.Name != "Eleven Multilingual v2" {
+		t.Fatalf("model[0]: %+v", m0)
+	}
+	// q filters by id or name, case-insensitive
+	page, err = Adapter{}.ListModels(context.Background(), call(srv, ""), provider.ModelQuery{Q: "TURBO"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Models) != 1 || page.Models[0].ID != "eleven_turbo_v2_5" {
+		t.Fatalf("q filter: %+v", page.Models)
+	}
+}

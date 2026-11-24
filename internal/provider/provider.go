@@ -13,10 +13,11 @@ import (
 )
 
 type ProviderConfig struct {
-	ID      string
-	Type    string
-	BaseURL string
-	Options json.RawMessage
+	ID       string
+	Type     string
+	BaseURL  string
+	ProxyURL string // "" inherits global/env, "direct" bypasses, else a proxy URL
+	Options  json.RawMessage
 }
 
 type AccountConfig struct {
@@ -74,6 +75,36 @@ type VideoGenerator interface {
 
 type SpeechGenerator interface {
 	Speak(ctx context.Context, c Call, r media.SpeechRequest) (*media.Audio, error)
+}
+
+// ModelQuery filters an upstream model catalog listing: free-text Q, a
+// vendor Category, a pagination Cursor, or explicit endpoint IDs
+// (find mode).
+type ModelQuery struct {
+	Q        string
+	Category string
+	Cursor   string
+	IDs      []string
+}
+
+// UpstreamModel is one importable entry of a provider's model catalog.
+type UpstreamModel struct {
+	ID          string     `json:"id"` // upstream id / endpoint_id
+	Name        string     `json:"name"`
+	Kind        media.Kind `json:"kind"` // image|video|speech; non-importable entries are dropped
+	Category    string     `json:"category"`
+	Description string     `json:"description,omitempty"`
+	Deprecated  bool       `json:"deprecated,omitempty"`
+}
+
+type ModelPage struct {
+	Models     []UpstreamModel
+	NextCursor string
+}
+
+// ModelLister is implemented by adapters that can list upstream models.
+type ModelLister interface {
+	ListModels(ctx context.Context, c Call, q ModelQuery) (ModelPage, error)
 }
 
 var (

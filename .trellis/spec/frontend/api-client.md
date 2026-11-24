@@ -1,6 +1,6 @@
 # API Client
 
-> `internal/web/assets/api.js` — the single fetch layer. Two APIs: `/admin/*` (Bearer ADMIN_TOKEN) and `/v1/*` (Bearer gateway key).
+> `internal/web/assets/api.js` — the single fetch layer. Two APIs: `/admin/*` (Bearer ADMIN_TOKEN) and `/v1/*` (same admin token — the backend accepts it; no gateway key is stored anymore).
 
 ---
 
@@ -14,9 +14,9 @@
 
 ## Behaviors to preserve
 
-- **401 on `admin()` → session reset**: `request()` clears the stored token and `location.reload()`s back to the login screen (the `isAdmin` flag restricts this to admin calls — a bad gateway key in the playground must not log the admin out).
+- **401 on `admin()` → session reset**: `request()` clears the stored token and `location.reload()`s back to the login screen (the `isAdmin` flag restricts this to admin calls — a 401 from a `v1()` call in the playground must not log the admin out).
 - Non-JSON responses are returned as text; errors always throw `ApiError`.
-- Endpoints used today: `/admin/status` (providers+accounts in one call), `/admin/provider-types`, `/admin/providers*` , `/admin/providers/{id}/accounts`, `/admin/accounts/{id}[/reset]`, `/admin/models*`, `/admin/keys*`, `/admin/tasks?status=&limit=`, `/admin/logs?account=&since=<unix-ms>&limit=`, `/v1/models`, `/v1/images/generations|edits`, `/v1/videos`, `/v1/audio/speech`.
+- Endpoints used today: `/admin/status` (providers+accounts in one call), `/admin/provider-types`, `/admin/providers*` , `/admin/providers/{id}/accounts`, `/admin/accounts/{id}[/reset]`, `/admin/models*`, `/admin/keys*` + `/admin/keys/{id}/secret` (key copy), `/admin/settings`, `/admin/proxies*` (代理池 CRUD — ui.js `proxies()` caches the list per page; `invalidateProxies()` after mutations), `/admin/proxy/test` (proxyField's 测试), `/admin/tasks?status=&limit=`, `/admin/logs?account=&since=<unix-ms>&limit=`, `/v1/models`, `/v1/images/generations|edits`, `/v1/videos`, `/v1/audio/speech`.
 
 ## Adding a call
 

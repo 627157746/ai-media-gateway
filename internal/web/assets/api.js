@@ -1,7 +1,8 @@
-// Fetch helpers: admin API (Bearer ADMIN_TOKEN) and gateway API (Bearer sk-mg-*).
+// Fetch helpers: admin API (Bearer ADMIN_TOKEN) and gateway API (the same
+// admin token — /v1/* accepts it, so the 试用 page needs no gateway key).
 
 const ADMIN_KEY = 'mgw_admin_token';
-const GW_KEY = 'mgw_gateway_key';
+localStorage.removeItem('mgw_gateway_key'); // stale key from the sk-mg-* era
 
 export function getToken() {
   return sessionStorage.getItem(ADMIN_KEY) || localStorage.getItem(ADMIN_KEY) || '';
@@ -16,9 +17,6 @@ export function clearToken() {
   sessionStorage.removeItem(ADMIN_KEY);
   localStorage.removeItem(ADMIN_KEY);
 }
-
-export function getGwKey() { return localStorage.getItem(GW_KEY) || ''; }
-export function saveGwKey(k) { k ? localStorage.setItem(GW_KEY, k) : localStorage.removeItem(GW_KEY); }
 
 // ApiError carries the OpenAI-shaped error body when present.
 export class ApiError extends Error {
@@ -53,7 +51,7 @@ async function request(path, opts = {}, token = '', isAdmin = false) {
 }
 
 export function admin(path, opts = {}) { return request(path, opts, getToken(), true); }
-export function v1(path, opts = {}) { return request(path, opts, getGwKey()); }
+export function v1(path, opts = {}) { return request(path, opts, getToken()); }
 
 // Validate an admin token without storing it.
 export async function validateToken(token) {

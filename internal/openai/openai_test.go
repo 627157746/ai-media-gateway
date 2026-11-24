@@ -11,6 +11,7 @@ import (
 	"net/textproto"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"ai-media-gateway/internal/admin"
 	"ai-media-gateway/internal/config"
 	"ai-media-gateway/internal/media"
+	"ai-media-gateway/internal/netproxy"
 	"ai-media-gateway/internal/openai"
 	"ai-media-gateway/internal/provider"
 	"ai-media-gateway/internal/secret"
@@ -86,14 +88,14 @@ func newEnv(t *testing.T) *env {
 	pool := accounts.New(st, box, config.Cooldowns{
 		RateLimit: time.Minute, Upstream: 30 * time.Second, UpstreamMax: 10 * time.Minute,
 		Quota: time.Hour, Auth: 24 * time.Hour,
-	}, http.DefaultClient, nil)
+	}, netproxy.NewClients(0), nil)
 	cfg := config.Config{AdminToken: "adm", MaxBodyBytes: 64 << 20, CORSOrigins: []string{"*"}}
-	_, key, _ := st.CreateAPIKey(context.Background(), "t")
+	_, key, _ := st.CreateAPIKey(context.Background(), "t", nil)
 	return &env{
 		t: t, st: st, box: box, key: key,
 		srv: server.New(server.Deps{
 			Config: cfg, Store: st, Pool: pool,
-			Admin: admin.New(st, box), OpenAI: openai.New(st, pool),
+			Admin: admin.New(st, box, netproxy.NewClients(0)), OpenAI: openai.New(st, pool),
 		}),
 	}
 }
@@ -493,6 +495,63 @@ func TestVideoListEndpoint(t *testing.T) {
 	}
 }
 
+// logParams records normalized request params — media inputs summarized
+// with sizes only (never bytes/base64), long extra strings elided.
+func TestRequestLogParams(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	fake.imgFn = func(c provider.Call, r media.ImageRequest) (*media.ImageResult, error) {
+		return &media.ImageResult{Images: []media.Asset{{URL: "u"}}}, nil
+	}
+
+	rec := e.jsonReq("POST", "/v1/images/generations", map[string]any{
+		"model": "img", "prompt": "a cat", "size": "1024x1024", "quality": "high",
+		"extra": map[string]any{"note": "ok", "blob": strings.Repeat("x", 600)},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	logs, _ := e.st.ListRequestLogs(context.Background(), "", time.Time{}, 10)
+	var p map[string]any
+	if err := json.Unmarshal(logs[0].Params, &p); err != nil {
+		t.Fatalf("params not JSON: %v", err)
+	}
+	if p["prompt"] != "a cat" || p["size"] != "1024x1024" || p["quality"] != "high" {
+		t.Fatalf("params: %v", p)
+	}
+	ex := p["extra"].(map[string]any)
+	if ex["note"] != "ok" || !strings.HasPrefix(ex["blob"].(string), "<已省略") {
+		t.Fatalf("extra: %v", ex)
+	}
+
+	// multipart edit: the uploaded file lands as a summary with bytes, no b64
+	rec = e.do(multipartReq(t, "/v1/images/edits",
+		map[string]string{"model": "img", "prompt": "make it blue"},
+		map[string][][]byte{"image": {[]byte("PNGDATA")}}))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	logs, _ = e.st.ListRequestLogs(context.Background(), "", time.Time{}, 10)
+	p = nil
+	if err := json.Unmarshal(logs[0].Params, &p); err != nil {
+		t.Fatalf("edit params not JSON: %v", err)
+	}
+	if p["edit"] != true {
+		t.Fatalf("edit flag: %v", p)
+	}
+	imgs, _ := p["images"].([]any)
+	if len(imgs) != 1 {
+		t.Fatalf("images: %v", p)
+	}
+	sum := imgs[0].(map[string]any)
+	if sum["bytes"].(float64) != 7 || sum["name"] == "" {
+		t.Fatalf("image summary: %v", sum)
+	}
+	if strings.Contains(string(logs[0].Params), "UE5HREFU") || strings.Contains(string(logs[0].Params), "base64") {
+		t.Fatalf("raw bytes leaked into params: %s", logs[0].Params)
+	}
+}
+
 // A failed request still records the last attempted account in request_logs.
 func TestFailedRequestLogsAccountID(t *testing.T) {
 	e := newEnv(t)
@@ -510,5 +569,33 @@ func TestFailedRequestLogsAccountID(t *testing.T) {
 	}
 	if logs[0].AccountID != "acc-a" || logs[0].Status != 400 {
 		t.Fatalf("log: %+v", logs[0])
+	}
+}
+
+// /v1/videos/{id}/content must download through the bound account's
+// effective proxy — the counting-proxy server stands in for an HTTP proxy
+// (plain-http fetches arrive as absolute-URI GETs).
+func TestVideoContentThroughAccountProxy(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	var hits int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Write([]byte("proxied"))
+	}))
+	defer proxy.Close()
+	px := proxy.URL
+	if err := e.st.UpdateAccount(context.Background(), "acc-a", store.AccountPatch{ProxyURL: &px}); err != nil {
+		t.Fatal(err)
+	}
+	e.st.CreateVideoTask(context.Background(), &store.VideoTask{
+		ID: "video_p", ModelID: "vid", ProviderID: "p1", AccountID: "acc-a",
+		Handle: media.TaskHandle(`{}`), Status: media.TaskCompleted, Progress: 100,
+		ResultURL: "http://upstream.invalid/v.mp4",
+	})
+
+	rec := e.do(httptest.NewRequest("GET", "/v1/videos/video_p/content", nil))
+	if rec.Code != 200 || rec.Body.String() != "proxied" || atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("content: code=%d body=%q hits=%d", rec.Code, rec.Body, hits)
 	}
 }

@@ -14,12 +14,14 @@ type APIKey struct {
 	ID         string     `json:"id"`
 	Name       string     `json:"name"`
 	KeyHash    string     `json:"-"`
+	KeyEnc     []byte     `json:"-"`
+	Copyable   bool       `json:"copyable"`
 	Enabled    bool       `json:"enabled"`
 	CreatedAt  time.Time  `json:"created_at"`
 	LastUsedAt *time.Time `json:"last_used_at"`
 }
 
-const keyCols = `id,name,key_hash,enabled,created_at,last_used_at`
+const keyCols = `id,name,key_hash,key_enc,enabled,created_at,last_used_at`
 
 func keyHash(plaintext string) string {
 	sum := sha256.Sum256([]byte(plaintext))
@@ -35,8 +37,10 @@ func RandHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// CreateAPIKey returns the row and the plaintext key 鈥?shown exactly once.
-func (s *Store) CreateAPIKey(ctx context.Context, name string) (*APIKey, string, error) {
+// CreateAPIKey returns the row and the plaintext key. When seal is non-nil
+// the plaintext is also stored encrypted (key_enc) so it can be recovered
+// later; keys written without it keep only the hash and are not copyable.
+func (s *Store) CreateAPIKey(ctx context.Context, name string, seal func([]byte) ([]byte, error)) (*APIKey, string, error) {
 	plaintext := "sk-mg-" + RandHex(16)
 	k := &APIKey{
 		ID:        "key_" + RandHex(6),
@@ -45,26 +49,40 @@ func (s *Store) CreateAPIKey(ctx context.Context, name string) (*APIKey, string,
 		Enabled:   true,
 		CreatedAt: time.UnixMilli(nowMS()),
 	}
+	if seal != nil {
+		enc, err := seal([]byte(plaintext))
+		if err != nil {
+			return nil, "", err
+		}
+		k.KeyEnc = enc
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO api_keys(`+keyCols+`) VALUES(?,?,?,?,?,?)`,
-		k.ID, k.Name, k.KeyHash, k.Enabled, k.CreatedAt.UnixMilli(), nil)
+		`INSERT INTO api_keys(`+keyCols+`) VALUES(?,?,?,?,?,?,?)`,
+		k.ID, k.Name, k.KeyHash, k.KeyEnc, k.Enabled, k.CreatedAt.UnixMilli(), nil)
 	if err != nil {
 		return nil, "", err
 	}
+	k.Copyable = len(k.KeyEnc) > 0
 	return k, plaintext, nil
+}
+
+func (s *Store) GetAPIKey(ctx context.Context, id string) (*APIKey, error) {
+	return scanKey(s.db.QueryRowContext(ctx,
+		`SELECT `+keyCols+` FROM api_keys WHERE id=?`, id))
 }
 
 func scanKey(row interface{ Scan(...any) error }) (*APIKey, error) {
 	k := &APIKey{}
 	var usedAt sql.NullInt64
 	var created int64
-	err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Enabled, &created, &usedAt)
+	err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.KeyEnc, &k.Enabled, &created, &usedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	k.Copyable = len(k.KeyEnc) > 0
 	k.CreatedAt = time.UnixMilli(created)
 	k.LastUsedAt = timeFromMS(usedAt)
 	return k, nil

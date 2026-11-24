@@ -1,5 +1,5 @@
-import { v1, getGwKey, saveGwKey } from '../api.js';
-import { h, toast, errMsg, field } from '../ui.js';
+import { v1, getToken } from '../api.js';
+import { h, errMsg, field } from '../ui.js';
 
 const KIND_LABEL = { image: '图片', video: '视频', speech: '语音' };
 
@@ -7,22 +7,12 @@ export function mountPlayground(root) {
   let stopPoll = () => {};
   let models = [];
 
-  // ---- gateway key bar ----
-  const keyIn = h('input', { type: 'password', value: getGwKey(), placeholder: 'sk-mg-…' });
-  const keyBar = h('div', { class: 'toolbar' },
-    h('span', { class: 'muted', text: '网关密钥' }),
-    h('div', { class: 'w320' }, keyIn),
-    h('button', { class: 'btn sm primary', text: '保存', onclick: () => { saveGwKey(keyIn.value.trim()); toast('已保存试用密钥', 'ok'); loadModels(); } }),
-    h('a', { href: '#/keys', text: '去 API Key 页创建 ↗' }));
-
   const bodyEl = h('div');
   root.append(
-    h('div', { class: 'banner', text: '试用会真实调用供应商并产生费用' }),
-    keyBar,
+    h('div', { class: 'banner', text: '试用会真实调用平台并产生费用' }),
     bodyEl);
 
   async function loadModels() {
-    if (!getGwKey()) { bodyEl.textContent = ''; bodyEl.append(h('div', { class: 'empty', text: '请先填写网关密钥（sk-mg-*）' })); return; }
     try {
       const data = await v1('/v1/models');
       models = data.data || [];
@@ -149,7 +139,7 @@ export function mountPlayground(root) {
             if (t.status === 'completed' && t.video_url) {
               stop();
               // same-origin /content proxy: never send the gateway key to the vendor CDN
-              const r = await fetch(`/v1/videos/${encodeURIComponent(t.id)}/content`, { headers: { Authorization: `Bearer ${getGwKey()}` } });
+              const r = await fetch(`/v1/videos/${encodeURIComponent(t.id)}/content`, { headers: { Authorization: `Bearer ${getToken()}` } });
               if (!r.ok) throw new Error(`下载视频失败 HTTP ${r.status}`);
               const url = URL.createObjectURL(await r.blob());
               out.append(h('video', { controls: '', src: url }),
@@ -199,7 +189,7 @@ export function mountPlayground(root) {
         if (sp > 0) body.speed = sp;
         const r = await fetch('/v1/audio/speech', {
           method: 'POST',
-          headers: { Authorization: `Bearer ${getGwKey()}`, 'Content-Type': 'application/json' },
+          headers: { Authorization: `Bearer ${getToken()}`, 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         if (!r.ok) {

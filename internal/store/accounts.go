@@ -16,6 +16,7 @@ type Account struct {
 	Name          string
 	APIKeyEnc     []byte
 	BaseURL       string
+	ProxyURL      string // "" inherits, "direct" bypasses, else a proxy URL
 	Options       json.RawMessage
 	Priority      int
 	Weight        int
@@ -32,7 +33,7 @@ type Account struct {
 }
 
 const accountCols = `id,provider_id,name,api_key_enc,base_url,options,priority,weight,enabled,
-	cooldown_until,fail_count,success_count,failure_count,last_error,last_error_at,last_used_at,created_at,updated_at`
+	cooldown_until,fail_count,success_count,failure_count,last_error,last_error_at,last_used_at,created_at,updated_at,proxy_url`
 
 func scanAccount(row interface{ Scan(...any) error }) (*Account, error) {
 	a := &Account{}
@@ -43,7 +44,7 @@ func scanAccount(row interface{ Scan(...any) error }) (*Account, error) {
 	var created, updated int64
 	err := row.Scan(&a.ID, &a.ProviderID, &a.Name, &a.APIKeyEnc, &base, &opts,
 		&a.Priority, &a.Weight, &a.Enabled, &cool, &a.FailCount, &a.SuccessCount,
-		&a.FailureCount, &lastErr, &errAt, &usedAt, &created, &updated)
+		&a.FailureCount, &lastErr, &errAt, &usedAt, &created, &updated, &a.ProxyURL)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -98,10 +99,10 @@ func (s *Store) CreateAccount(ctx context.Context, a *Account) error {
 	}
 	now := nowMS()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO accounts(`+accountCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO accounts(`+accountCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.ProviderID, a.Name, a.APIKeyEnc, strOrNil(a.BaseURL), optsOrEmpty(a.Options),
 		a.Priority, a.Weight, a.Enabled, msOrNil(a.CooldownUntil), 0, 0, 0,
-		nil, nil, nil, now, now)
+		nil, nil, nil, now, now, a.ProxyURL)
 	if err != nil {
 		return err
 	}
@@ -113,6 +114,7 @@ type AccountPatch struct {
 	Name      *string
 	APIKeyEnc *[]byte // re-sealed by caller
 	BaseURL   *string
+	ProxyURL  *string
 	Options   *json.RawMessage
 	Priority  *int
 	Weight    *int
@@ -134,6 +136,9 @@ func (s *Store) UpdateAccount(ctx context.Context, id string, p AccountPatch) er
 	}
 	if p.BaseURL != nil {
 		add("base_url", strOrNil(*p.BaseURL))
+	}
+	if p.ProxyURL != nil {
+		add("proxy_url", *p.ProxyURL)
 	}
 	if p.Options != nil {
 		add("options", optsOrEmpty(*p.Options))

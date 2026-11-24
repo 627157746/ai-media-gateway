@@ -33,7 +33,7 @@ function render(listEl, tasks) {
   listEl.textContent = '';
   const table = h('table', null,
     h('thead', null, h('tr', null,
-      ['任务 ID', '模型', '供应商', '账号', '状态', '进度', '创建时间', '完成时间', '结果 / 错误'].map(t => h('th', { text: t })))),
+      ['任务 ID', '模型', '平台', '账号', '状态', '进度', '创建时间', '完成时间', '结果 / 错误'].map(t => h('th', { text: t })))),
     h('tbody'));
   for (const t of tasks) {
     table.lastChild.append(h('tr', null,

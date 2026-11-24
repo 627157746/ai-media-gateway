@@ -105,6 +105,52 @@ func TestProviderDeleteConflict(t *testing.T) {
 	}
 }
 
+func TestModelRename(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	st.CreateProvider(ctx, &Provider{ID: "p1", Type: "t"})
+	st.CreateModel(ctx, &Model{ID: "m-old", ProviderID: "p1", Kind: media.KindVideo, Upstream: "u"})
+	st.CreateModel(ctx, &Model{ID: "m-taken", ProviderID: "p1", Kind: media.KindImage, Upstream: "u2"})
+	st.CreateVideoTask(ctx, &VideoTask{ID: "t1", ModelID: "m-old", ProviderID: "p1", Status: media.TaskInProgress})
+	st.CreateVideoTask(ctx, &VideoTask{ID: "t2", ModelID: "other", ProviderID: "p1", Status: media.TaskInProgress})
+
+	newID, takenID, missingSrc := "m-new", "m-taken", "m-x"
+	if err := st.UpdateModel(ctx, "m-old", ModelPatch{ID: &newID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetModel(ctx, "m-old"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old id still resolves: %v", err)
+	}
+	m, err := st.GetModel(ctx, "m-new")
+	if err != nil || m.Upstream != "u" {
+		t.Fatalf("renamed row: %v %+v", err, m)
+	}
+	tk, _ := st.GetVideoTask(ctx, "t1")
+	if tk.ModelID != "m-new" {
+		t.Fatalf("task model_id = %q", tk.ModelID)
+	}
+	tk, _ = st.GetVideoTask(ctx, "t2")
+	if tk.ModelID != "other" {
+		t.Fatalf("unrelated task rewritten: %q", tk.ModelID)
+	}
+
+	// rename onto an existing id conflicts and changes nothing
+	if err := st.UpdateModel(ctx, "m-new", ModelPatch{ID: &takenID}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("want conflict, got %v", err)
+	}
+	if _, err := st.GetModel(ctx, "m-new"); err != nil {
+		t.Fatal("conflict clobbered the source row")
+	}
+	if tk, _ := st.GetVideoTask(ctx, "t1"); tk.ModelID != "m-new" {
+		t.Fatalf("conflict rewrote tasks: %q", tk.ModelID)
+	}
+
+	// missing old id
+	if err := st.UpdateModel(ctx, "ghost", ModelPatch{ID: &missingSrc}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want not found, got %v", err)
+	}
+}
+
 func TestAccountHealth(t *testing.T) {
 	st := open(t)
 	ctx := context.Background()
@@ -143,12 +189,30 @@ func TestAccountHealth(t *testing.T) {
 func TestAPIKeyAuth(t *testing.T) {
 	st := open(t)
 	ctx := context.Background()
-	k, plain, err := st.CreateAPIKey(ctx, "main")
+	seal := func(b []byte) ([]byte, error) { return append([]byte("enc:"), b...), nil }
+	k, plain, err := st.CreateAPIKey(ctx, "main", seal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(plain, "sk-mg-") || len(plain) != len("sk-mg-")+32 {
 		t.Fatalf("bad key format %q", plain)
+	}
+	if !k.Copyable || len(k.KeyEnc) == 0 {
+		t.Fatalf("sealed key should be copyable: %+v", k)
+	}
+	got, err := st.GetAPIKey(ctx, k.ID)
+	if err != nil || !got.Copyable || string(got.KeyEnc) != "enc:"+plain {
+		t.Fatalf("get: %v %+v", err, got)
+	}
+	noSeal, _, err := st.CreateAPIKey(ctx, "legacy", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noSeal.Copyable || len(noSeal.KeyEnc) != 0 {
+		t.Fatalf("nil seal must not be copyable: %+v", noSeal)
+	}
+	if got, _ := st.GetAPIKey(ctx, noSeal.ID); got.Copyable {
+		t.Fatalf("stored nil-seal key must not be copyable: %+v", got)
 	}
 	auth, err := st.AuthenticateKey(ctx, plain)
 	if err != nil {
@@ -167,10 +231,19 @@ func TestRequestLogs(t *testing.T) {
 	ctx := context.Background()
 	old := time.Now().Add(-48 * time.Hour)
 	st.InsertRequestLog(ctx, &RequestLog{At: old, Endpoint: "GET /v1/x", AccountID: "a1", Status: 200, LatencyMs: 5})
-	st.InsertRequestLog(ctx, &RequestLog{Endpoint: "GET /v1/y", AccountID: "a2", Status: 500, LatencyMs: 7, Error: "e"})
+	st.InsertRequestLog(ctx, &RequestLog{Endpoint: "GET /v1/y", AccountID: "a2", Status: 500, LatencyMs: 7, Error: "e",
+		Params: json.RawMessage(`{"prompt":"hi","n":2}`)})
 	logs, err := st.ListRequestLogs(ctx, "", time.Time{}, 10)
 	if err != nil || len(logs) != 2 {
 		t.Fatalf("list: %v %d", err, len(logs))
+	}
+	// params round-trip: the newest entry carries them, the old one has none
+	var p map[string]any
+	if err := json.Unmarshal(logs[0].Params, &p); err != nil || p["prompt"] != "hi" || p["n"] != 2.0 {
+		t.Fatalf("params: %v %s", err, logs[0].Params)
+	}
+	if len(logs[1].Params) != 0 {
+		t.Fatalf("empty params: %s", logs[1].Params)
 	}
 	logs, _ = st.ListRequestLogs(ctx, "a1", time.Time{}, 10)
 	if len(logs) != 1 || logs[0].AccountID != "a1" {
@@ -222,5 +295,73 @@ func TestMigrationWeightMin(t *testing.T) {
 	}
 	if a.Weight != 1 {
 		t.Fatalf("weight: %d", a.Weight)
+	}
+}
+
+func TestProxyCRUDAndUsages(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+
+	// create/list/get
+	p := &Proxy{Name: "hk", URL: "http://u:p@127.0.0.1:7890"}
+	if err := st.CreateProxy(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(p.ID, "px_") {
+		t.Fatalf("id: %q", p.ID)
+	}
+	p2 := &Proxy{Name: "alpha", URL: "socks5://h:1080"}
+	st.CreateProxy(ctx, p2)
+	list, err := st.ListProxies(ctx)
+	if err != nil || len(list) != 2 || list[0].Name != "alpha" {
+		t.Fatalf("list: %v %+v", err, list)
+	}
+	got, err := st.GetProxy(ctx, p.ID)
+	if err != nil || got.URL != p.URL {
+		t.Fatalf("get: %v %+v", err, got)
+	}
+
+	// patch
+	nm, u := "hk2", "http://127.0.0.1:8888"
+	if err := st.UpdateProxy(ctx, p.ID, &nm, &u); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = st.GetProxy(ctx, p.ID)
+	if got.Name != "hk2" || got.URL != u {
+		t.Fatalf("patched: %+v", got)
+	}
+	if err := st.UpdateProxy(ctx, "px_ghost", &nm, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("patch missing: %v", err)
+	}
+
+	// usages: settings + provider + account
+	ref := "proxy:" + p.ID
+	st.SetSetting(ctx, "proxy_url", ref)
+	st.CreateProvider(ctx, &Provider{ID: "p1", Type: "fal", Enabled: true})
+	st.UpdateProvider(ctx, "p1", ProviderPatch{ProxyURL: &ref})
+	st.CreateProvider(ctx, &Provider{ID: "p2", Type: "fal", Enabled: true})
+	st.CreateAccount(ctx, &Account{ID: "a1", ProviderID: "p1", Name: "main", ProxyURL: ref, Enabled: true})
+	st.CreateAccount(ctx, &Account{ID: "a2", ProviderID: "p2", ProxyURL: ref, Enabled: true})
+	used, err := st.ProxyUsages(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(used, " | ")
+	for _, want := range []string{"全局", "平台 p1", "账号 main（p1）", "账号 a2（p2）"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("usages %v missing %q", used, want)
+		}
+	}
+	used, _ = st.ProxyUsages(ctx, p2.ID)
+	if len(used) != 0 {
+		t.Fatalf("unused proxy usages: %v", used)
+	}
+
+	// delete
+	if err := st.DeleteProxy(ctx, p2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetProxy(ctx, p2.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted: %v", err)
 	}
 }

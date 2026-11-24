@@ -98,6 +98,57 @@ func (Adapter) Speak(ctx context.Context, c provider.Call, r media.SpeechRequest
 	return &media.Audio{Body: resp.Body, ContentType: ct}, nil
 }
 
+type elModel struct {
+	ModelID           string `json:"model_id"`
+	Name              string `json:"name"`
+	Description       string `json:"description"`
+	CanDoTextToSpeech bool   `json:"can_do_text_to_speech"`
+}
+
+// ListModels returns the account's TTS-capable models (GET /v1/models).
+func (Adapter) ListModels(ctx context.Context, c provider.Call, q provider.ModelQuery) (provider.ModelPage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL(defaultBase)+"/v1/models", nil)
+	if err != nil {
+		return provider.ModelPage{}, err
+	}
+	req.Header.Set("xi-api-key", c.Account.APIKey)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return provider.ModelPage{}, provider.TransportError(err, false)
+	}
+	if resp.StatusCode/100 != 2 {
+		return provider.ModelPage{}, statusError(resp)
+	}
+	var list []elModel
+	err = json.NewDecoder(resp.Body).Decode(&list)
+	resp.Body.Close()
+	if err != nil {
+		return provider.ModelPage{}, &media.UpstreamError{
+			Class: media.ClassUpstream, Status: resp.StatusCode,
+			Message: "bad models response: " + err.Error(),
+		}
+	}
+	ql := strings.ToLower(q.Q)
+	out := provider.ModelPage{Models: []provider.UpstreamModel{}}
+	for _, m := range list {
+		if !m.CanDoTextToSpeech {
+			continue
+		}
+		if ql != "" && !strings.Contains(strings.ToLower(m.ModelID), ql) && !strings.Contains(strings.ToLower(m.Name), ql) {
+			continue
+		}
+		name := m.Name
+		if name == "" {
+			name = m.ModelID
+		}
+		out.Models = append(out.Models, provider.UpstreamModel{
+			ID: m.ModelID, Name: name, Kind: media.KindSpeech,
+			Category: "text-to-speech", Description: m.Description,
+		})
+	}
+	return out, nil
+}
+
 // statusError maps ElevenLabs errors; detail may be {status,message}, a
 // string, or an array.
 func statusError(resp *http.Response) error {

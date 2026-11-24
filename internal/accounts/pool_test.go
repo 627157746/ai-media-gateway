@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"ai-media-gateway/internal/config"
 	"ai-media-gateway/internal/media"
+	"ai-media-gateway/internal/netproxy"
 	"ai-media-gateway/internal/provider"
 	"ai-media-gateway/internal/secret"
 	"ai-media-gateway/internal/store"
@@ -46,7 +50,7 @@ func newFixture(t *testing.T) *fixture {
 
 func (f *fixture) pool() *Pool {
 	cur := &f.cur
-	return New(f.st, f.box, f.cfg, &http.Client{}, func() time.Time { return *cur })
+	return New(f.st, f.box, f.cfg, netproxy.NewClients(0), func() time.Time { return *cur })
 }
 
 func (f *fixture) provider(t *testing.T, id string) {
@@ -519,5 +523,139 @@ func TestResultAccountIDOnFailure(t *testing.T) {
 	})
 	if err == nil || res.Attempts != 1 || res.AccountID != "acc-a" {
 		t.Fatalf("invalid-first: res=%+v err=%v", res, err)
+	}
+}
+
+// A counting httptest server doubles as an HTTP proxy: for a plain-http
+// request the transport sends it an absolute-URI GET, which is enough to
+// prove which proxy (if any) the call's HTTP client used.
+func TestProxyPrecedence(t *testing.T) {
+	f := newFixture(t)
+	var hitsA, hitsB, hitsG, hitsTarget int32
+	mkProxy := func(hits *int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(hits, 1)
+			w.WriteHeader(200)
+		}))
+	}
+	proxyA := mkProxy(&hitsA)
+	proxyB := mkProxy(&hitsB)
+	proxyG := mkProxy(&hitsG)
+	defer proxyA.Close()
+	defer proxyB.Close()
+	defer proxyG.Close()
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitsTarget, 1)
+		w.WriteHeader(200)
+	}))
+	defer target.Close()
+
+	f.provider(t, "p1")
+	f.account(t, "acc-a", "p1", 0, 1)
+	p := f.pool()
+	setAcct := func(v string) {
+		if err := f.st.UpdateAccount(context.Background(), "acc-a", store.AccountPatch{ProxyURL: &v}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.st.SetSetting(context.Background(), "proxy_url", proxyG.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	get := func(m Resolved) error {
+		_, err := p.Do(context.Background(), m, func(ctx context.Context, c provider.Call) error {
+			resp, err := c.HTTP.Get(target.URL)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			return nil
+		})
+		return err
+	}
+	res := Resolved{Provider: provider.ProviderConfig{ID: "p1", ProxyURL: proxyB.URL}}
+
+	// account proxy beats provider+global
+	setAcct(proxyA.URL)
+	if err := get(res); err != nil || hitsA != 1 || hitsB != 0 || hitsG != 0 {
+		t.Fatalf("account level: err=%v A=%d B=%d G=%d", err, hitsA, hitsB, hitsG)
+	}
+	// account empty → provider
+	setAcct("")
+	if err := get(res); err != nil || hitsB != 1 || hitsG != 0 {
+		t.Fatalf("provider level: err=%v B=%d G=%d", err, hitsB, hitsG)
+	}
+	// provider empty → global
+	if err := get(Resolved{Provider: provider.ProviderConfig{ID: "p1"}}); err != nil || hitsG != 1 {
+		t.Fatalf("global level: err=%v G=%d", err, hitsG)
+	}
+	// "direct" at account level bypasses the provider proxy
+	setAcct("direct")
+	if err := get(res); err != nil || hitsB != 1 || hitsTarget != 1 {
+		t.Fatalf("direct: err=%v B=%d target=%d", err, hitsB, hitsTarget)
+	}
+}
+
+// proxy:<id> pool references resolve through the store: URL changes take
+// effect on the next call, and a deleted entry errors instead of going direct.
+func TestProxyPoolReference(t *testing.T) {
+	f := newFixture(t)
+	var hitsA, hitsB, hitsTarget int32
+	mk := func(hits *int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(hits, 1)
+			w.WriteHeader(200)
+		}))
+	}
+	proxyA, proxyB := mk(&hitsA), mk(&hitsB)
+	defer proxyA.Close()
+	defer proxyB.Close()
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hitsTarget, 1)
+	}))
+	defer target.Close()
+
+	ctx := context.Background()
+	px := &store.Proxy{Name: "p", URL: proxyA.URL}
+	if err := f.st.CreateProxy(ctx, px); err != nil {
+		t.Fatal(err)
+	}
+	f.provider(t, "p1")
+	f.account(t, "acc-a", "p1", 0, 1)
+	ref := "proxy:" + px.ID
+	if err := f.st.UpdateAccount(ctx, "acc-a", store.AccountPatch{ProxyURL: &ref}); err != nil {
+		t.Fatal(err)
+	}
+	p := f.pool()
+	get := func() error {
+		_, err := p.Do(ctx, resolved("p1"), func(ctx context.Context, c provider.Call) error {
+			resp, err := c.HTTP.Get(target.URL)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			return nil
+		})
+		return err
+	}
+
+	// reference routes through the pool URL
+	if err := get(); err != nil || hitsA != 1 {
+		t.Fatalf("ref: err=%v hitsA=%d", err, hitsA)
+	}
+	// updating the pool URL takes effect next call
+	if err := f.st.UpdateProxy(ctx, px.ID, nil, &proxyB.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := get(); err != nil || hitsB != 1 || hitsA != 1 {
+		t.Fatalf("re-pointed: err=%v A=%d B=%d", err, hitsA, hitsB)
+	}
+	// deleted entry → error, no silent direct
+	if err := f.st.DeleteProxy(ctx, px.ID); err != nil {
+		t.Fatal(err)
+	}
+	err := get()
+	if err == nil || !strings.Contains(err.Error(), "已被删除") || hitsTarget != 0 {
+		t.Fatalf("dangling ref: err=%v target=%d", err, hitsTarget)
 	}
 }

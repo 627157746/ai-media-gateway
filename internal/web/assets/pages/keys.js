@@ -1,4 +1,4 @@
-import { admin, saveGwKey } from '../api.js';
+import { admin } from '../api.js';
 import { h, openSheet, sheetButtons, confirmDialog, modalDialog, toast, errMsg, relTime, fmtTime, copyText, field } from '../ui.js';
 
 export function mountKeys(root) {
@@ -31,6 +31,16 @@ function render(listEl, keys, reload) {
       h('td', { class: 'muted', text: k.last_used_at ? relTime(k.last_used_at) : '从未使用' }),
       h('td', null,
         h('button', {
+          class: 'btn sm', text: '复制', disabled: !k.copyable,
+          title: k.copyable ? null : '旧版本密钥无法找回，请新建',
+          onclick: async () => {
+            try {
+              const res = await admin(`/admin/keys/${k.id}/secret`);
+              copyText(res.key);
+            } catch (e) { toast(errMsg(e), 'bad'); }
+          },
+        }),
+        h('button', {
           class: 'btn sm danger', text: '删除', onclick: async () => {
             if (!await confirmDialog(`删除密钥 "${k.name || k.id}"？使用该密钥的客户端将立即失效。`)) return;
             try { await admin(`/admin/keys/${k.id}`, { method: 'DELETE' }); toast('已删除', 'ok'); reload(); }
@@ -62,18 +72,12 @@ function createSheet(reload) {
 }
 
 function showKeyOnce(k, reload) {
-  const useBtn = h('button', {
-    class: 'btn', text: '用于试用',
-    onclick: () => { saveGwKey(k.key); toast('已保存为试用密钥', 'ok'); },
-  });
-  const close = modalDialog('密钥已创建 — 仅显示这一次，请立即保存',
+  const close = modalDialog('密钥已创建',
     h('div', null,
       h('div', { class: 'muted', text: `${k.name || k.id}:` }),
       h('div', { class: 'key-show', text: k.key }),
       h('div', { class: 'row start' },
         h('button', { class: 'btn primary', text: '复制', onclick: () => copyText(k.key) }),
-        useBtn,
-        h('span', { class: 'muted fs12 self-c', text: '「用于试用」会把此密钥填入试用页面' }),
         h('span', { class: 'spacer' }),
         h('button', { class: 'btn', text: '关闭', onclick: () => close() }))));
   reload();

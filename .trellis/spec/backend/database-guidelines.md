@@ -13,7 +13,7 @@
 
 - SQL files embedded via `embed.FS` (`migrationsFS`), named `NNN_<name>.sql`; the numeric prefix is the version. `schema_version` table holds the applied version; `Store.migrate` runs pending files in order, each in a transaction.
 - **Adding one**: create `00N_<name>.sql` with the next number and bump nothing else. Never edit a migration that has shipped — deployed DBs will not re-run it. Data-fix migrations are fine: `002_weight_min.sql` (`UPDATE accounts SET weight = 1 WHERE weight < 1;`) repaired legacy rows after the admin API started enforcing `weight >= 1` (`TestMigrationWeightMin`).
-- Tables: `providers`, `accounts`, `models`, `api_keys`, `video_tasks`, `request_logs` (`001_init.sql`).
+- Tables: `providers`, `accounts`, `models`, `api_keys`, `video_tasks`, `request_logs` (`001_init.sql`), `settings` (`005_proxy.sql`, `key`/`value` kv — `GetSetting`/`SetSetting`; `proxy_url` is the only key so far), `proxies` (`006_proxies.sql`, `px_`+RandHex(6) ids — the named 代理池). `proxy_url` (`""`=inherit / `direct` / URL / `proxy:<id>` ref) lives on `providers`+`accounts` (`005_proxy.sql`); admin validates scheme http/https/socks5/socks5h plus `proxy:` existence.
 
 ## Conventions
 

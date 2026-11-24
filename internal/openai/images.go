@@ -87,6 +87,7 @@ func (h *handler) generateImage(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, err)
 		return
 	}
+	logParams(r, imageParams(req))
 	h.runImage(w, r, in.Model, req)
 }
 
@@ -148,6 +149,7 @@ func (h *handler) editImage(w http.ResponseWriter, r *http.Request) {
 			req.Mask = mask
 		}
 	}
+	logParams(r, imageParams(req))
 	h.runImage(w, r, in.Model, req)
 }
 
@@ -166,10 +168,12 @@ func (h *handler) runImage(w http.ResponseWriter, r *http.Request, modelID strin
 	}
 	gen := ad.(provider.ImageGenerator)
 	var result *media.ImageResult
+	var stream *http.Client
 	pr, err := h.pool.Do(r.Context(), res, func(ctx context.Context, c provider.Call) error {
 		out, err := gen.GenerateImage(ctx, c, req)
 		if err == nil {
 			result = out
+			stream = c.Stream
 		}
 		return err
 	})
@@ -187,7 +191,7 @@ func (h *handler) runImage(w http.ResponseWriter, r *http.Request, modelID strin
 			continue
 		}
 		if wantB64 {
-			b64, err := h.fetchB64(r, a.URL)
+			b64, err := h.fetchB64(r, a.URL, stream)
 			if err != nil {
 				httpx.Fail(w, r, err)
 				return
@@ -203,8 +207,8 @@ func (h *handler) runImage(w http.ResponseWriter, r *http.Request, modelID strin
 	})
 }
 
-func (h *handler) fetchB64(r *http.Request, u string) (string, error) {
-	resp, err := provider.FetchURL(r.Context(), h.stream, u, "")
+func (h *handler) fetchB64(r *http.Request, u string, client *http.Client) (string, error) {
+	resp, err := provider.FetchURL(r.Context(), client, u, "")
 	if err != nil {
 		return "", provider.TransportError(err, false)
 	}

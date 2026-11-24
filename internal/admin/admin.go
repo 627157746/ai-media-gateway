@@ -1,15 +1,21 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"ai-media-gateway/internal/accounts"
 	"ai-media-gateway/internal/httpx"
 	"ai-media-gateway/internal/media"
+	"ai-media-gateway/internal/netproxy"
 	"ai-media-gateway/internal/provider"
 	"ai-media-gateway/internal/secret"
 	"ai-media-gateway/internal/store"
@@ -22,20 +28,25 @@ var idRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 var modelIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*$`)
 
 type handler struct {
-	st  *store.Store
-	box *secret.Box
-	now func() time.Time
+	st      *store.Store
+	box     *secret.Box
+	clients *netproxy.Clients
+	now     func() time.Time
 }
 
 // New returns the admin API handler (already mounted under /admin/).
-func New(st *store.Store, box *secret.Box) http.Handler {
-	h := &handler{st: st, box: box, now: time.Now}
+func New(st *store.Store, box *secret.Box, clients *netproxy.Clients) http.Handler {
+	if clients == nil {
+		clients = netproxy.NewClients(0)
+	}
+	h := &handler{st: st, box: box, clients: clients, now: time.Now}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /admin/providers", h.listProviders)
 	m.HandleFunc("POST /admin/providers", h.createProvider)
 	m.HandleFunc("GET /admin/providers/{id}", h.getProvider)
 	m.HandleFunc("PATCH /admin/providers/{id}", h.patchProvider)
 	m.HandleFunc("DELETE /admin/providers/{id}", h.deleteProvider)
+	m.HandleFunc("GET /admin/providers/{id}/upstream-models", h.upstreamModels)
 	m.HandleFunc("GET /admin/providers/{id}/accounts", h.listAccounts)
 	m.HandleFunc("POST /admin/providers/{id}/accounts", h.createAccount)
 	m.HandleFunc("GET /admin/accounts/{id}", h.getAccount)
@@ -49,11 +60,19 @@ func New(st *store.Store, box *secret.Box) http.Handler {
 	m.HandleFunc("DELETE /admin/models/{id}", h.deleteModel)
 	m.HandleFunc("GET /admin/keys", h.listKeys)
 	m.HandleFunc("POST /admin/keys", h.createKey)
+	m.HandleFunc("GET /admin/keys/{id}/secret", h.keySecret)
 	m.HandleFunc("DELETE /admin/keys/{id}", h.deleteKey)
 	m.HandleFunc("GET /admin/tasks", h.listTasks)
 	m.HandleFunc("GET /admin/logs", h.listLogs)
 	m.HandleFunc("GET /admin/status", h.status)
 	m.HandleFunc("GET /admin/provider-types", h.providerTypes)
+	m.HandleFunc("GET /admin/settings", h.getSettings)
+	m.HandleFunc("PATCH /admin/settings", h.patchSettings)
+	m.HandleFunc("POST /admin/proxy/test", h.proxyTest)
+	m.HandleFunc("GET /admin/proxies", h.listProxies)
+	m.HandleFunc("POST /admin/proxies", h.createProxy)
+	m.HandleFunc("PATCH /admin/proxies/{id}", h.patchProxy)
+	m.HandleFunc("DELETE /admin/proxies/{id}", h.deleteProxy)
 	return m
 }
 
@@ -83,6 +102,44 @@ func validOptions(raw json.RawMessage) bool {
 	return json.Unmarshal(raw, &o) == nil
 }
 
+// validProxyURL accepts "", "direct", or a URL with scheme http/https/
+// socks5/socks5h and a non-empty host.
+func validProxyURL(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "direct" {
+		return true
+	}
+	return validProxyScheme(v)
+}
+
+// validProxyScheme accepts only a real proxy URL — not "", "direct" or a
+// proxy:<id> pool reference (those are meaningful only as a proxy_url value).
+func validProxyScheme(v string) bool {
+	u, err := url.Parse(v)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	}
+	return false
+}
+
+// validProxyValue accepts anything validProxyURL accepts plus a "proxy:<id>"
+// reference to an existing pool entry.
+func (h *handler) validProxyValue(ctx context.Context, v string) bool {
+	v = strings.TrimSpace(v)
+	if validProxyURL(v) {
+		return true
+	}
+	if id, ok := strings.CutPrefix(v, "proxy:"); ok && id != "" {
+		_, err := h.st.GetProxy(ctx, id)
+		return err == nil
+	}
+	return false
+}
+
 // ---- providers ----
 
 func (h *handler) listProviders(w http.ResponseWriter, r *http.Request) {
@@ -104,11 +161,12 @@ func (h *handler) getProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 type providerIn struct {
-	ID      string          `json:"id"`
-	Type    string          `json:"type"`
-	BaseURL string          `json:"base_url"`
-	Options json.RawMessage `json:"options"`
-	Enabled *bool           `json:"enabled"`
+	ID       string          `json:"id"`
+	Type     string          `json:"type"`
+	BaseURL  string          `json:"base_url"`
+	ProxyURL string          `json:"proxy_url"`
+	Options  json.RawMessage `json:"options"`
+	Enabled  *bool           `json:"enabled"`
 }
 
 func (h *handler) createProvider(w http.ResponseWriter, r *http.Request) {
@@ -132,12 +190,17 @@ func (h *handler) createProvider(w http.ResponseWriter, r *http.Request) {
 		fail(w, bad("options must be a JSON object"))
 		return
 	}
+	if !h.validProxyValue(r.Context(), in.ProxyURL) {
+		fail(w, bad("proxy_url 无效：留空表示继承，direct 表示直连，或填 http/https/socks5/socks5h 代理地址"))
+		return
+	}
 	p := &store.Provider{
-		ID:      in.ID,
-		Type:    in.Type,
-		BaseURL: in.BaseURL,
-		Options: in.Options,
-		Enabled: in.Enabled == nil || *in.Enabled,
+		ID:       in.ID,
+		Type:     in.Type,
+		BaseURL:  in.BaseURL,
+		ProxyURL: strings.TrimSpace(in.ProxyURL),
+		Options:  in.Options,
+		Enabled:  in.Enabled == nil || *in.Enabled,
 	}
 	if err := h.st.CreateProvider(r.Context(), p); err != nil {
 		fail(w, err)
@@ -147,10 +210,11 @@ func (h *handler) createProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 type providerPatchIn struct {
-	Type    *string          `json:"type"`
-	BaseURL *string          `json:"base_url"`
-	Options *json.RawMessage `json:"options"`
-	Enabled *bool            `json:"enabled"`
+	Type     *string          `json:"type"`
+	BaseURL  *string          `json:"base_url"`
+	ProxyURL *string          `json:"proxy_url"`
+	Options  *json.RawMessage `json:"options"`
+	Enabled  *bool            `json:"enabled"`
 }
 
 func (h *handler) patchProvider(w http.ResponseWriter, r *http.Request) {
@@ -168,16 +232,134 @@ func (h *handler) patchProvider(w http.ResponseWriter, r *http.Request) {
 		fail(w, bad("options must be a JSON object"))
 		return
 	}
+	if in.ProxyURL != nil {
+		v := strings.TrimSpace(*in.ProxyURL)
+		if !h.validProxyValue(r.Context(), v) {
+			fail(w, bad("proxy_url 无效：留空表示继承，direct 表示直连，或填 http/https/socks5/socks5h 代理地址"))
+			return
+		}
+		in.ProxyURL = &v
+	}
 	if err := h.st.UpdateProvider(r.Context(), r.PathValue("id"), store.ProviderPatch{
-		Type:    in.Type,
-		BaseURL: in.BaseURL,
-		Options: in.Options,
-		Enabled: in.Enabled,
+		Type:     in.Type,
+		BaseURL:  in.BaseURL,
+		ProxyURL: in.ProxyURL,
+		Options:  in.Options,
+		Enabled:  in.Enabled,
 	}); err != nil {
 		fail(w, err)
 		return
 	}
 	h.getProvider(w, r)
+}
+
+// upstreamModels lists a provider's model catalog via the adapter's
+// ModelLister, using the highest-priority enabled account that has a key
+// (non-cooling preferred). fal may query anonymously; other types 400
+// without a key. The key never reaches the response.
+func (h *handler) upstreamModels(w http.ResponseWriter, r *http.Request) {
+	p, err := h.st.GetProvider(r.Context(), r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	adapter, ok := provider.Get(p.Type)
+	if !ok {
+		fail(w, bad("unknown provider type %q", p.Type))
+		return
+	}
+	lister, ok := adapter.(provider.ModelLister)
+	if !ok {
+		fail(w, bad("平台 %s 不支持获取上游模型列表", p.Type))
+		return
+	}
+	accs, err := h.st.ListAccounts(r.Context(), p.ID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	var pick, cooling *store.Account
+	now := h.now()
+	for _, a := range accs { // ListAccounts is ordered by priority DESC
+		if !a.Enabled || len(a.APIKeyEnc) == 0 {
+			continue
+		}
+		if a.CooldownUntil != nil && a.CooldownUntil.After(now) {
+			if cooling == nil {
+				cooling = a
+			}
+			continue
+		}
+		pick = a
+		break
+	}
+	if pick == nil {
+		pick = cooling
+	}
+	if pick == nil && p.Type != "fal" {
+		fail(w, bad("该平台还没有可用的 key，请先添加"))
+		return
+	}
+	global, err := h.st.GetSetting(r.Context(), "proxy_url")
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	acctProxy := ""
+	if pick != nil {
+		acctProxy = pick.ProxyURL
+	}
+	url, err := accounts.ResolveProxy(r.Context(), h.st, netproxy.Effective(acctProxy, p.ProxyURL, global))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	call := provider.Call{
+		Provider: provider.ProviderConfig{ID: p.ID, Type: p.Type, BaseURL: p.BaseURL, ProxyURL: p.ProxyURL, Options: p.Options},
+	}
+	call.HTTP, call.Stream = h.clients.For(url)
+	if pick != nil {
+		call.Account = provider.AccountConfig{
+			ID: pick.ID, Name: pick.Name, BaseURL: pick.BaseURL, Options: pick.Options,
+		}
+		key, err := h.box.Open(pick.APIKeyEnc)
+		if err != nil {
+			fail(w, fmt.Errorf("decrypt key of account %s: %w", pick.ID, err))
+			return
+		}
+		call.Account.APIKey = string(key)
+	}
+	qs := r.URL.Query()
+	page, err := lister.ListModels(r.Context(), call, provider.ModelQuery{
+		Q:        qs.Get("q"),
+		Category: qs.Get("category"),
+		Cursor:   qs.Get("cursor"),
+		IDs:      qs["endpoint_id"],
+	})
+	if err != nil {
+		fail(w, scrubKey(err, call.Account.APIKey))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"data":        page.Models,
+		"next_cursor": page.NextCursor,
+	})
+}
+
+// scrubKey removes the decrypted API key from an upstream error (a vendor
+// could echo it back in an error message).
+func scrubKey(err error, key string) error {
+	if err == nil || key == "" || !strings.Contains(err.Error(), key) {
+		return err
+	}
+	var ue *media.UpstreamError
+	if errors.As(err, &ue) {
+		cp := *ue
+		cp.Message = strings.ReplaceAll(cp.Message, key, "***")
+		cp.Code = strings.ReplaceAll(cp.Code, key, "***")
+		return &cp
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), key, "***"))
 }
 
 func (h *handler) deleteProvider(w http.ResponseWriter, r *http.Request) {
@@ -217,6 +399,7 @@ type accountIn struct {
 	Name     string          `json:"name"`
 	APIKey   string          `json:"api_key"`
 	BaseURL  string          `json:"base_url"`
+	ProxyURL string          `json:"proxy_url"`
 	Options  json.RawMessage `json:"options"`
 	Priority *int            `json:"priority"`
 	Weight   *int            `json:"weight"`
@@ -243,6 +426,10 @@ func (h *handler) createAccount(w http.ResponseWriter, r *http.Request) {
 		fail(w, bad("options must be a JSON object"))
 		return
 	}
+	if !h.validProxyValue(r.Context(), in.ProxyURL) {
+		fail(w, bad("proxy_url 无效：留空表示继承，direct 表示直连，或填 http/https/socks5/socks5h 代理地址"))
+		return
+	}
 	var enc []byte
 	if in.APIKey != "" {
 		var err error
@@ -258,6 +445,7 @@ func (h *handler) createAccount(w http.ResponseWriter, r *http.Request) {
 		Name:       in.Name,
 		APIKeyEnc:  enc,
 		BaseURL:    in.BaseURL,
+		ProxyURL:   strings.TrimSpace(in.ProxyURL),
 		Options:    in.Options,
 		Enabled:    in.Enabled == nil || *in.Enabled,
 		Weight:     1,
@@ -283,6 +471,7 @@ type accountPatchIn struct {
 	Name     *string          `json:"name"`
 	APIKey   *string          `json:"api_key"`
 	BaseURL  *string          `json:"base_url"`
+	ProxyURL *string          `json:"proxy_url"`
 	Options  *json.RawMessage `json:"options"`
 	Priority *int             `json:"priority"`
 	Weight   *int             `json:"weight"`
@@ -302,8 +491,17 @@ func (h *handler) patchAccount(w http.ResponseWriter, r *http.Request) {
 		fail(w, bad("weight must be >= 1"))
 		return
 	}
+	if in.ProxyURL != nil {
+		v := strings.TrimSpace(*in.ProxyURL)
+		if !h.validProxyValue(r.Context(), v) {
+			fail(w, bad("proxy_url 无效：留空表示继承，direct 表示直连，或填 http/https/socks5/socks5h 代理地址"))
+			return
+		}
+		in.ProxyURL = &v
+	}
 	var patch store.AccountPatch
 	patch.Name, patch.BaseURL, patch.Options = in.Name, in.BaseURL, in.Options
+	patch.ProxyURL = in.ProxyURL
 	patch.Priority, patch.Weight, patch.Enabled = in.Priority, in.Weight, in.Enabled
 	if in.APIKey != nil && *in.APIKey != "" {
 		enc, err := h.box.Seal([]byte(*in.APIKey))
@@ -342,6 +540,7 @@ type accountOut struct {
 	Name          string          `json:"name"`
 	APIKeyMasked  string          `json:"api_key_masked"`
 	BaseURL       string          `json:"base_url"`
+	ProxyURL      string          `json:"proxy_url"`
 	Options       json.RawMessage `json:"options"`
 	Priority      int             `json:"priority"`
 	Weight        int             `json:"weight"`
@@ -367,7 +566,7 @@ func (h *handler) accountOut(a *store.Account) accountOut {
 	}
 	return accountOut{
 		ID: a.ID, ProviderID: a.ProviderID, Name: a.Name,
-		APIKeyMasked: h.maskKey(a.APIKeyEnc), BaseURL: a.BaseURL, Options: a.Options,
+		APIKeyMasked: h.maskKey(a.APIKeyEnc), BaseURL: a.BaseURL, ProxyURL: a.ProxyURL, Options: a.Options,
 		Priority: a.Priority, Weight: a.Weight, Enabled: a.Enabled, State: state,
 		CooldownUntil: a.CooldownUntil, FailCount: a.FailCount,
 		SuccessCount: a.SuccessCount, FailureCount: a.FailureCount,
@@ -465,6 +664,7 @@ func (h *handler) createModel(w http.ResponseWriter, r *http.Request) {
 }
 
 type modelPatchIn struct {
+	ID         *string          `json:"id"`
 	ProviderID *string          `json:"provider_id"`
 	Kind       *string          `json:"kind"`
 	Upstream   *string          `json:"upstream"`
@@ -477,11 +677,23 @@ func (h *handler) patchModel(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &in) {
 		return
 	}
+	oldID := r.PathValue("id")
+	newID := oldID
 	patch := store.ModelPatch{
 		ProviderID: in.ProviderID,
 		Upstream:   in.Upstream,
 		Options:    in.Options,
 		Enabled:    in.Enabled,
+	}
+	if in.ID != nil {
+		if !modelIDRE.MatchString(*in.ID) {
+			fail(w, bad("model id required and must match [a-z0-9][a-z0-9.-]*"))
+			return
+		}
+		if *in.ID != oldID {
+			patch.ID = in.ID
+			newID = *in.ID
+		}
 	}
 	if in.Kind != nil {
 		k := media.Kind(*in.Kind)
@@ -501,11 +713,16 @@ func (h *handler) patchModel(w http.ResponseWriter, r *http.Request) {
 		fail(w, bad("options must be a JSON object"))
 		return
 	}
-	if err := h.st.UpdateModel(r.Context(), r.PathValue("id"), patch); err != nil {
+	if err := h.st.UpdateModel(r.Context(), oldID, patch); err != nil {
 		fail(w, err)
 		return
 	}
-	h.getModel(w, r)
+	m, err := h.st.GetModel(r.Context(), newID)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, m)
 }
 
 func (h *handler) deleteModel(w http.ResponseWriter, r *http.Request) {
@@ -534,7 +751,7 @@ func (h *handler) createKey(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &in) {
 		return
 	}
-	k, plaintext, err := h.st.CreateAPIKey(r.Context(), in.Name)
+	k, plaintext, err := h.st.CreateAPIKey(r.Context(), in.Name, h.box.Seal)
 	if err != nil {
 		fail(w, err)
 		return
@@ -542,6 +759,26 @@ func (h *handler) createKey(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{
 		"id": k.ID, "name": k.Name, "key": plaintext,
 	})
+}
+
+// keySecret returns the plaintext of a copyable key; pre-key_enc rows kept
+// only the hash and can't be recovered.
+func (h *handler) keySecret(w http.ResponseWriter, r *http.Request) {
+	k, err := h.st.GetAPIKey(r.Context(), r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if len(k.KeyEnc) == 0 {
+		fail(w, bad("这个密钥是旧版本创建的，只保存了哈希，无法找回，请新建一个"))
+		return
+	}
+	plain, err := h.box.Open(k.KeyEnc)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"key": string(plain)})
 }
 
 func (h *handler) deleteKey(w http.ResponseWriter, r *http.Request) {
@@ -610,4 +847,237 @@ func (h *handler) status(w http.ResponseWriter, r *http.Request) {
 		out = append(out, ps)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"providers": out})
+}
+
+// ---- settings / proxy test ----
+
+func (h *handler) getSettings(w http.ResponseWriter, r *http.Request) {
+	proxy, err := h.st.GetSetting(r.Context(), "proxy_url")
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"proxy_url": proxy})
+}
+
+func (h *handler) patchSettings(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ProxyURL *string `json:"proxy_url"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if in.ProxyURL != nil {
+		v := strings.TrimSpace(*in.ProxyURL)
+		if !h.validProxyValue(r.Context(), v) {
+			fail(w, bad("proxy_url 无效：留空表示跟随系统环境变量，direct 表示直连，或填 http/https/socks5/socks5h 代理地址"))
+			return
+		}
+		if err := h.st.SetSetting(r.Context(), "proxy_url", v); err != nil {
+			fail(w, err)
+			return
+		}
+	}
+	h.getSettings(w, r)
+}
+
+// proxyTest does a GET through the given proxy value ("", "direct" or a URL)
+// with a throwaway transport; any HTTP status counts as reachable.
+func (h *handler) proxyTest(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ProxyURL string `json:"proxy_url"`
+		Target   string `json:"target"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	v := strings.TrimSpace(in.ProxyURL)
+	if !h.validProxyValue(r.Context(), v) {
+		fail(w, bad("proxy_url 无效：留空表示跟随系统环境变量，direct 表示直连，或填 http/https/socks5/socks5h 代理地址"))
+		return
+	}
+	purl, err := accounts.ResolveProxy(r.Context(), h.st, v)
+	if err != nil {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	target := in.Target
+	if target == "" {
+		target = "https://queue.fal.run/"
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	switch purl {
+	case "":
+		tr.Proxy = http.ProxyFromEnvironment
+	case "direct":
+		tr.Proxy = nil
+	default:
+		u, _ := url.Parse(purl) // validated above
+		tr.Proxy = http.ProxyURL(u)
+	}
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	start := h.now()
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "error": maskProxyErr(err, purl),
+		})
+		return
+	}
+	resp.Body.Close()
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "status": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds(),
+	})
+}
+
+// maskProxyErr scrubs the proxy password out of a transport error message
+// (net/http errors echo the proxy URL).
+func maskProxyErr(err error, proxyURL string) string {
+	msg := err.Error()
+	if u, perr := url.Parse(proxyURL); perr == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			msg = strings.ReplaceAll(msg, pw, "***")
+			msg = strings.ReplaceAll(msg, url.QueryEscape(pw), "***")
+		}
+	}
+	return msg
+}
+
+// ---- proxy pool ----
+
+// proxyOut is the pool entry as the UI needs it: masked URL + usage labels.
+func (h *handler) proxyOut(ctx context.Context, p *store.Proxy) (map[string]any, error) {
+	used, err := h.st.ProxyUsages(ctx, p.ID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"id": p.ID, "name": p.Name, "url": p.URL,
+		"url_masked": netproxy.Mask(p.URL), "used_by": used,
+		"created_at": p.CreatedAt, "updated_at": p.UpdatedAt,
+	}, nil
+}
+
+func (h *handler) listProxies(w http.ResponseWriter, r *http.Request) {
+	ps, err := h.st.ListProxies(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(ps))
+	for _, p := range ps {
+		o, err := h.proxyOut(r.Context(), p)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		out = append(out, o)
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"proxies": out})
+}
+
+type proxyIn struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+func validProxyIn(h *handler, in proxyIn) (*store.Proxy, error) {
+	p := &store.Proxy{Name: strings.TrimSpace(in.Name), URL: strings.TrimSpace(in.URL)}
+	if p.Name == "" || len(p.Name) > 64 {
+		return nil, bad("name 必填且不超过 64 字符")
+	}
+	if !validProxyScheme(p.URL) {
+		return nil, bad("url 必须是 http/https/socks5/socks5h 代理地址")
+	}
+	return p, nil
+}
+
+func (h *handler) createProxy(w http.ResponseWriter, r *http.Request) {
+	var in proxyIn
+	if !readJSON(w, r, &in) {
+		return
+	}
+	p, err := validProxyIn(h, in)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if err := h.st.CreateProxy(r.Context(), p); err != nil {
+		fail(w, err)
+		return
+	}
+	o, err := h.proxyOut(r.Context(), p)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, o)
+}
+
+type proxyPatchIn struct {
+	Name *string `json:"name"`
+	URL  *string `json:"url"`
+}
+
+func (h *handler) patchProxy(w http.ResponseWriter, r *http.Request) {
+	var in proxyPatchIn
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if in.Name != nil {
+		v := strings.TrimSpace(*in.Name)
+		if v == "" || len(v) > 64 {
+			fail(w, bad("name 必填且不超过 64 字符"))
+			return
+		}
+		in.Name = &v
+	}
+	if in.URL != nil {
+		v := strings.TrimSpace(*in.URL)
+		if !validProxyScheme(v) {
+			fail(w, bad("url 必须是 http/https/socks5/socks5h 代理地址"))
+			return
+		}
+		in.URL = &v
+	}
+	id := r.PathValue("id")
+	if err := h.st.UpdateProxy(r.Context(), id, in.Name, in.URL); err != nil {
+		fail(w, err)
+		return
+	}
+	p, err := h.st.GetProxy(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	o, err := h.proxyOut(r.Context(), p)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, o)
+}
+
+// deleteProxy refuses while anything still references the pool entry.
+func (h *handler) deleteProxy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	used, err := h.st.ProxyUsages(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if len(used) > 0 {
+		httpx.Error(w, http.StatusConflict, "该代理正在被使用："+strings.Join(used, "、"), "conflict", "conflict")
+		return
+	}
+	if err := h.st.DeleteProxy(r.Context(), id); err != nil {
+		fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

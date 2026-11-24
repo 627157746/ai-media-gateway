@@ -62,7 +62,7 @@ docker compose up -d --build
 curl -X POST http://localhost:8080/admin/keys \
   -H "Authorization: Bearer admintoken" -H "Content-Type: application/json" \
   -d '{"name":"canvas"}'
-# → {"id":"...","name":"canvas","key":"sk-mg-..."}   key 只返回这一次，请保存
+# → {"id":"...","name":"canvas","key":"sk-mg-..."}   之后可在 API Key 页随时复制
 ```
 
 ### 2. 注册供应商与账户
@@ -154,6 +154,29 @@ curl "http://localhost:8080/admin/logs?limit=50" -H "Authorization: Bearer admin
 curl "http://localhost:8080/admin/tasks?status=queued" -H "Authorization: Bearer admintoken"        # 视频任务
 ```
 
+## 代理
+
+网关支持三级代理配置，**优先级：账号代理 > 平台代理 > 全局代理**，留空表示继承上一级：
+
+- **账号代理**：平台卡片上某个 key 的「编辑 → 更多设置 → 代理」，只影响这一个 key。
+- **平台代理**：平台的「编辑 → 代理」，影响该平台下所有未单独设置代理的 key。
+- **全局代理**：「设置」页（或 `PATCH /admin/settings` 的 `proxy_url`），影响所有未单独设置的平台/账号。
+
+取值：`留空` = 继承上一级；`direct` = 直连（不走任何代理，可覆盖上一级配置）；代理池引用（在设置里选已保存的代理）；或代理 URL，支持 `http` / `https` / `socks5` / `socks5h`，可带 `user:pass@` 认证。全部为留空时沿用 `HTTPS_PROXY` 等系统环境变量。界面上的「测试」按钮会实际探测连通性。
+
+**代理池**：「设置 → 代理池」里保存的命名代理，三级配置里都能直接下拉选用；改池里的地址，所有引用立即生效。正在被引用的代理不能删除（409 会列出占用方）。
+
+```bash
+# 例：让 fal 平台的所有请求走本地 Clash
+curl -X PATCH http://localhost:8080/admin/providers/fal -H "Authorization: Bearer admintoken" \
+  -d '{"proxy_url":"http://127.0.0.1:7890"}'
+# 例：全局走 socks5，但某个 key 直连
+curl -X PATCH http://localhost:8080/admin/settings -H "Authorization: Bearer admintoken" \
+  -d '{"proxy_url":"socks5://127.0.0.1:1080"}'
+curl -X PATCH http://localhost:8080/admin/accounts/<id> -H "Authorization: Bearer admintoken" \
+  -d '{"proxy_url":"direct"}'
+```
+
 ## 客户端调用
 
 ### Infinite Canvas
@@ -162,8 +185,11 @@ curl "http://localhost:8080/admin/tasks?status=queued" -H "Authorization: Bearer
 - `baseUrl`：`http://<host>:8080`（**不要**带 `/v1`，Canvas 会自己拼 `/v1`）
 - `apiKey`：上面第 1 步创建的 `sk-mg-...` 网关密钥
 - 模型：填注册的模型 id（如 `seedance-2.5`、`flux-pro`、`eleven-v3`），或直通名 `fal/<fal 端点>`
+- Canvas 按模型名猜测能力类型（名字含 video/tts/image 等关键词），不读取 `/v1/models` 的 `kind`；「从平台获取」导入时会自动补 `-video` / `-tts` / `-image` 后缀，识别不对时在 Canvas 渠道编辑里手动切换能力即可。
 
 ### 接口一览
+
+`/v1/*` 端点除 `sk-mg-*` 网关密钥外也接受 `ADMIN_TOKEN`（内置「试用」页面就是这么鉴权的）；客户端仍应使用 `sk-mg-*` 密钥。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|

@@ -25,7 +25,7 @@ func New(d Deps) http.Handler {
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", healthz)
 	if d.OpenAI != nil {
-		root.Handle("/v1/", gatewayAuth(d.Store, d.OpenAI))
+		root.Handle("/v1/", gatewayAuth(d.Store, d.Config.AdminToken, d.OpenAI))
 	}
 	if d.Admin != nil {
 		root.Handle("/admin/", adminAuth(d.Config.AdminToken, d.Admin))

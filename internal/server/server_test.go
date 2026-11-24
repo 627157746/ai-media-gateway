@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ai-media-gateway/internal/accounts"
 	"ai-media-gateway/internal/admin"
 	"ai-media-gateway/internal/config"
+	"ai-media-gateway/internal/netproxy"
 	"ai-media-gateway/internal/openai"
 	"ai-media-gateway/internal/secret"
 	"ai-media-gateway/internal/server"
@@ -38,18 +40,18 @@ func newEnv(t *testing.T) *env {
 		MaxBodyBytes: 1 << 20,
 		CORSOrigins:  []string{"*"},
 	}
-	_, plain, err := st.CreateAPIKey(context.Background(), "test")
+	_, plain, err := st.CreateAPIKey(context.Background(), "test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	box := secret.New("mk")
-	pool := accounts.New(st, box, config.Cooldowns{}, http.DefaultClient, nil)
+	pool := accounts.New(st, box, config.Cooldowns{}, netproxy.NewClients(0), nil)
 	return &env{
 		t:  t,
 		st: st,
 		srv: server.New(server.Deps{
 			Config: cfg, Store: st, Pool: pool,
-			Admin: admin.New(st, box), OpenAI: openai.New(st, pool), Web: web.Handler(),
+			Admin: admin.New(st, box, netproxy.NewClients(0)), OpenAI: openai.New(st, pool), Web: web.Handler(),
 		}),
 		key: plain,
 	}
@@ -106,6 +108,13 @@ func TestV1Auth(t *testing.T) {
 	}
 	if rec := e.do("GET", "/v1/models", "", "sk-mg-wrong"); rec.Code != 401 {
 		t.Fatalf("bad key: %d", rec.Code)
+	}
+	// the admin token is accepted too (the built-in 试用 page uses it)
+	if rec := e.do("GET", "/v1/models", "", "adm-token"); rec.Code != 200 {
+		t.Fatalf("admin token: %d body=%s", rec.Code, rec.Body)
+	}
+	if rec := e.do("GET", "/v1/models", "", "adm-token-x"); rec.Code != 401 {
+		t.Fatalf("near-admin token: %d", rec.Code)
 	}
 	rec := e.do("GET", "/v1/models", "", e.key)
 	if rec.Code != 200 {
@@ -199,5 +208,29 @@ func TestWebUINoAuth(t *testing.T) {
 	}
 	if rec := e.do("GET", "/no-such-page", "", ""); rec.Code != 404 {
 		t.Fatalf("unknown: %d", rec.Code)
+	}
+}
+
+// request_logs records only model-generation calls: GET /v1/models must not
+// create a row, while POST /v1/images/generations does (even when it fails).
+func TestRequestLogOnlyModelCalls(t *testing.T) {
+	e := newEnv(t)
+	if rec := e.do("GET", "/v1/models", "", e.key); rec.Code != 200 {
+		t.Fatalf("models: %d", rec.Code)
+	}
+	logs, err := e.st.ListRequestLogs(context.Background(), "", time.Time{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("GET /v1/models logged: %+v", logs)
+	}
+	e.do("POST", "/v1/images/generations", `{"model":"nope","prompt":"x"}`, e.key)
+	logs, err = e.st.ListRequestLogs(context.Background(), "", time.Time{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Endpoint != "POST /v1/images/generations" {
+		t.Fatalf("image call not logged: %+v", logs)
 	}
 }

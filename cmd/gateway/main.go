@@ -13,6 +13,7 @@ import (
 	"ai-media-gateway/internal/accounts"
 	"ai-media-gateway/internal/admin"
 	"ai-media-gateway/internal/config"
+	"ai-media-gateway/internal/netproxy"
 	"ai-media-gateway/internal/openai"
 	"ai-media-gateway/internal/secret"
 	"ai-media-gateway/internal/server"
@@ -43,9 +44,9 @@ func run() error {
 	defer st.Close()
 
 	box := secret.New(cfg.MasterKey)
-	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	pool := accounts.New(st, box, cfg.Cooldowns, client, time.Now)
-	adminHandler := admin.New(st, box)
+	clients := netproxy.NewClients(cfg.HTTPTimeout)
+	pool := accounts.New(st, box, cfg.Cooldowns, clients, time.Now)
+	adminHandler := admin.New(st, box, clients)
 	openaiHandler := openai.New(st, pool)
 
 	srv := &http.Server{

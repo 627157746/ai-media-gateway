@@ -13,6 +13,7 @@ type Provider struct {
 	ID        string          `json:"id"`
 	Type      string          `json:"type"`
 	BaseURL   string          `json:"base_url"`
+	ProxyURL  string          `json:"proxy_url"`
 	Options   json.RawMessage `json:"options"`
 	Enabled   bool            `json:"enabled"`
 	CreatedAt time.Time       `json:"created_at"`
@@ -23,7 +24,7 @@ func scanProvider(row interface{ Scan(...any) error }) (*Provider, error) {
 	p := &Provider{}
 	var opts []byte
 	var created, updated int64
-	err := row.Scan(&p.ID, &p.Type, &p.BaseURL, &opts, &p.Enabled, &created, &updated)
+	err := row.Scan(&p.ID, &p.Type, &p.BaseURL, &opts, &p.Enabled, &p.ProxyURL, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -35,7 +36,7 @@ func scanProvider(row interface{ Scan(...any) error }) (*Provider, error) {
 	return p, nil
 }
 
-const providerCols = `id,type,base_url,options,enabled,created_at,updated_at`
+const providerCols = `id,type,base_url,options,enabled,proxy_url,created_at,updated_at`
 
 func (s *Store) GetProvider(ctx context.Context, id string) (*Provider, error) {
 	return scanProvider(s.db.QueryRowContext(ctx,
@@ -67,8 +68,8 @@ func (s *Store) CreateProvider(ctx context.Context, p *Provider) error {
 	}
 	now := nowMS()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO providers(`+providerCols+`) VALUES(?,?,?,?,?,?,?)`,
-		p.ID, p.Type, p.BaseURL, optsOrEmpty(p.Options), p.Enabled, now, now)
+		`INSERT INTO providers(`+providerCols+`) VALUES(?,?,?,?,?,?,?,?)`,
+		p.ID, p.Type, p.BaseURL, optsOrEmpty(p.Options), p.Enabled, p.ProxyURL, now, now)
 	if err != nil {
 		return err
 	}
@@ -77,10 +78,11 @@ func (s *Store) CreateProvider(ctx context.Context, p *Provider) error {
 }
 
 type ProviderPatch struct {
-	Type    *string
-	BaseURL *string
-	Options *json.RawMessage
-	Enabled *bool
+	Type     *string
+	BaseURL  *string
+	ProxyURL *string
+	Options  *json.RawMessage
+	Enabled  *bool
 }
 
 func (s *Store) UpdateProvider(ctx context.Context, id string, p ProviderPatch) error {
@@ -93,6 +95,10 @@ func (s *Store) UpdateProvider(ctx context.Context, id string, p ProviderPatch) 
 	if p.BaseURL != nil {
 		sets = append(sets, "base_url=?")
 		args = append(args, *p.BaseURL)
+	}
+	if p.ProxyURL != nil {
+		sets = append(sets, "proxy_url=?")
+		args = append(args, *p.ProxyURL)
 	}
 	if p.Options != nil {
 		sets = append(sets, "options=?")

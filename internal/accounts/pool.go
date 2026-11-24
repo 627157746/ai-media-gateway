@@ -12,6 +12,7 @@ import (
 
 	"ai-media-gateway/internal/config"
 	"ai-media-gateway/internal/media"
+	"ai-media-gateway/internal/netproxy"
 	"ai-media-gateway/internal/provider"
 	"ai-media-gateway/internal/secret"
 	"ai-media-gateway/internal/store"
@@ -46,23 +47,25 @@ func (e *NoAccountError) Error() string {
 
 // Pool selects accounts, runs attempts with failover, and tracks health.
 type Pool struct {
-	st     *store.Store
-	box    *secret.Box
-	cfg    config.Cooldowns
-	client *http.Client
-	stream *http.Client
-	now    func() time.Time
+	st      *store.Store
+	box     *secret.Box
+	cfg     config.Cooldowns
+	clients *netproxy.Clients
+	now     func() time.Time
 
 	mu sync.Mutex
 	// SWRR state per eligible-set key ("provider|id1,id2,..."), rebuilt on change.
 	rr map[string]*rrState
 }
 
-func New(st *store.Store, box *secret.Box, cfg config.Cooldowns, client *http.Client, now func() time.Time) *Pool {
+func New(st *store.Store, box *secret.Box, cfg config.Cooldowns, clients *netproxy.Clients, now func() time.Time) *Pool {
 	if now == nil {
 		now = time.Now
 	}
-	return &Pool{st: st, box: box, cfg: cfg, client: client, stream: &http.Client{}, now: now, rr: map[string]*rrState{}}
+	if clients == nil {
+		clients = netproxy.NewClients(0)
+	}
+	return &Pool{st: st, box: box, cfg: cfg, clients: clients, now: now, rr: map[string]*rrState{}}
 }
 
 // Do runs fn against eligible accounts until success or a non-failover error.
@@ -87,7 +90,7 @@ func (p *Pool) Do(ctx context.Context, m Resolved, fn func(ctx context.Context, 
 		if err := ctx.Err(); err != nil {
 			return Result{AccountID: lastID, Attempts: i}, err
 		}
-		call, err := p.callFor(a, m)
+		call, err := p.callFor(ctx, a, m)
 		if err != nil {
 			return Result{AccountID: a.ID, Attempts: i}, err
 		}
@@ -126,15 +129,49 @@ func (p *Pool) CallFor(ctx context.Context, m Resolved, accountID string) (provi
 	if a.ProviderID != m.Provider.ID {
 		return provider.Call{}, fmt.Errorf("account %s does not belong to provider %s", accountID, m.Provider.ID)
 	}
-	return p.callFor(a, m)
+	return p.callFor(ctx, a, m)
 }
 
-func (p *Pool) callFor(a *store.Account, m Resolved) (provider.Call, error) {
+// ResolveProxy maps an effective proxy value to its final URL: a "proxy:<id>"
+// pool reference resolves through store.GetProxy; "" / "direct" / URL pass
+// through unchanged. A dangling reference is an error, not silent direct.
+func ResolveProxy(ctx context.Context, st *store.Store, eff string) (string, error) {
+	if id, ok := strings.CutPrefix(eff, "proxy:"); ok {
+		p, err := st.GetProxy(ctx, id)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return "", fmt.Errorf("代理 %s 已被删除", id)
+			}
+			return "", err
+		}
+		return p.URL, nil
+	}
+	return eff, nil
+}
+
+// StreamForGlobal returns the stream client for the global proxy setting —
+// the fallback for downloads whose account/provider binding is gone.
+func (p *Pool) StreamForGlobal(ctx context.Context) (*http.Client, error) {
+	global, err := p.st.GetSetting(ctx, "proxy_url")
+	if err != nil {
+		return nil, err
+	}
+	url, err := ResolveProxy(ctx, p.st, global)
+	if err != nil {
+		return nil, err
+	}
+	_, stream := p.clients.For(url)
+	return stream, nil
+}
+
+func (p *Pool) callFor(ctx context.Context, a *store.Account, m Resolved) (provider.Call, error) {
+	global, err := p.st.GetSetting(ctx, "proxy_url")
+	if err != nil {
+		return provider.Call{}, err
+	}
 	call := provider.Call{
 		Provider: m.Provider,
 		Model:    m.Model,
-		HTTP:     p.client,
-		Stream:   p.stream,
 		Timeout:  p.cfg.ImageTimeout,
 		Account: provider.AccountConfig{
 			ID:      a.ID,
@@ -143,6 +180,12 @@ func (p *Pool) callFor(a *store.Account, m Resolved) (provider.Call, error) {
 			Options: a.Options,
 		},
 	}
+	eff := netproxy.Effective(a.ProxyURL, m.Provider.ProxyURL, global)
+	url, err := ResolveProxy(ctx, p.st, eff)
+	if err != nil {
+		return provider.Call{}, err
+	}
+	call.HTTP, call.Stream = p.clients.For(url)
 	if len(a.APIKeyEnc) > 0 {
 		key, err := p.box.Open(a.APIKeyEnc)
 		if err != nil {

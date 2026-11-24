@@ -6,18 +6,20 @@ import { mountLogs } from './pages/logs.js';
 import { mountTasks } from './pages/tasks.js';
 import { mountKeys } from './pages/keys.js';
 import { mountPlayground } from './pages/playground.js';
+import { mountSettings } from './pages/settings.js';
 
 const NAV = [
-  ['模型', [['#/providers', '供应商'], ['#/models', '模型']]],
-  ['网关', [['#/keys', 'API Key'], ['#/playground', '试用']]],
+  ['模型', [['#/providers', '平台'], ['#/models', '模型']]],
+  ['网关', [['#/keys', 'API Key'], ['#/playground', '试用'], ['#/settings', '设置']]],
   ['洞察', [['#/logs', '请求日志'], ['#/tasks', '视频任务']]],
 ];
 
 const ROUTES = {
-  '#/providers': { title: '供应商', desc: '上游供应商及其账号池：优先级、权重、冷却状态与故障转移。', mount: mountProviders },
-  '#/models': { title: '模型', desc: '对外暴露的模型别名，绑定供应商与上游端点。', mount: mountModels },
+  '#/providers': { title: '平台', desc: '上游平台及其 API Key 池：优先级、权重、冷却状态与故障转移。', mount: mountProviders },
+  '#/models': { title: '模型', desc: '对外暴露的模型别名，绑定平台与上游端点。', mount: mountModels },
   '#/keys': { title: 'API Key', desc: '客户端访问 /v1 接口所需的网关密钥（sk-mg-*）。', mount: mountKeys },
   '#/playground': { title: '试用', desc: '直接调用 /v1 接口验证模型配置。', mount: mountPlayground },
+  '#/settings': { title: '设置', desc: '全局网关设置：代理等。', mount: mountSettings },
   '#/logs': { title: '请求日志', desc: '每一次 /v1 请求的模型、账号、重试与结果。', mount: mountLogs },
   '#/tasks': { title: '视频任务', desc: '异步视频生成任务及其进度。', mount: mountTasks },
 };
@@ -48,7 +50,7 @@ function themeSelect() {
 
 function renderLogin() {
   const tokenIn = h('input', { type: 'password', placeholder: 'ADMIN_TOKEN', autofocus: '' });
-  const remember = h('input', { type: 'checkbox' });
+  const remember = h('input', { type: 'checkbox', checked: true });
   const err = h('div', { class: 'err-text' });
   const btn = h('button', { class: 'btn primary', text: '登 录' });
   const submit = async () => {

@@ -125,18 +125,21 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, .btn:focus-vi
 .check { display: flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; }
 .check input { width: auto; }
 
-.switch { position: relative; width: 34px; height: 19px; flex: none; cursor: pointer; }
+.switch-wrap { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+.switch { position: relative; display: inline-block; vertical-align: middle; width: 36px; height: 20px; flex: none; cursor: pointer; }
 .switch input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
 .switch i {
   display: block; width: 100%; height: 100%; border-radius: 999px;
   background: var(--border); transition: background .15s;
 }
 .switch i::after {
-  content: ""; display: block; width: 15px; height: 15px; border-radius: 50%;
-  background: #fff; margin: 2px; transition: transform .15s;
+  content: ""; position: absolute; top: 2px; left: 2px;
+  display: block; width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  transition: transform .15s;
 }
 .switch input:checked + i { background: var(--accent); }
-.switch input:checked + i::after { transform: translateX(15px); }
+.switch input:checked + i::after { transform: translateX(16px); }
 .switch input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ---- tables / lists ---- */
@@ -144,6 +147,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, .btn:focus-vi
 table { width: 100%; border-collapse: collapse; font-size: 13px; white-space: nowrap; }
 th { text-align: left; font-weight: 600; font-size: 12px; color: var(--muted); padding: 9px 12px; border-bottom: 1px solid var(--border); }
 td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+td.mid { vertical-align: middle; }
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: var(--panel-2); }
 .kind-head td { background: var(--panel-2); font-weight: 650; font-size: 12.5px; }
@@ -152,6 +156,7 @@ tr:hover td { background: var(--panel-2); }
   background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 14px 16px; margin-bottom: 14px;
 }
+.card.off { opacity: .6; }
 .card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .card-head .title { font-weight: 650; font-size: 15px; }
 .card-head .spacer, .spacer { flex: 1; }
@@ -176,6 +181,7 @@ tr:hover td { background: var(--panel-2); }
 .pill.acc { background: var(--accent-soft); color: var(--accent); }
 .status-num.ok { color: var(--ok); font-weight: 650; }
 .status-num.warn { color: var(--warn); font-weight: 650; }
+.warn-text { color: var(--warn); font-size: 12px; }
 .status-num.bad { color: var(--bad); font-weight: 650; }
 
 /* ---- sheet (side panel) ---- */
@@ -240,7 +246,15 @@ tr:hover td { background: var(--panel-2); }
 .login-card h1 { font-size: 18px; margin-bottom: 4px; }
 .login-card .sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
 
-/* ---- utilities (no inline style attrs ¡ª CSP) ---- */
+/* ---- collapsible sections / key-value rows ---- */
+.more { border: 1px solid var(--border); border-radius: 8px; padding: 0 12px; margin: 10px 0; }
+.more > summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 8px 0; user-select: none; }
+.more[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+.kv-row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+.kv-row > input, .kv-row > select { flex: 1; min-width: 0; }
+.kv-row > .btn { flex: none; }
+
+/* ---- utilities (no inline style attrs â€” CSP) ---- */
 .w-auto { width: auto; }
 .w220 { width: 220px; }
 .w320 { width: 320px; }
@@ -256,4 +270,10 @@ tr:hover td { background: var(--panel-2); }
 .flex-1 { flex: 1; }
 .flex-2 { flex: 2; }
 .lbl { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-.cell-err { max-width: 320px; white-space: normal; }
+.cell-err { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+tr.row-click { cursor: pointer; }
+.kv-blocks { margin-bottom: 14px; }
+.kv-block { margin-bottom: 8px; }
+.kv-line { word-break: break-word; }
+.kv-extra { font-size: 12px; margin-top: 2px; }
+.pre-wrap { white-space: pre-wrap; word-break: break-word; }
