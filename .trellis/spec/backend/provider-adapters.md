@@ -73,6 +73,12 @@ Resolution order is therefore: **音色库 hit → `options.voices` alias → pa
 
 The admin endpoint reuses `handler.upstreamCall` (shared with `upstreamModels`) for account selection, proxy resolution and key decryption, and every upstream error must pass through `scrubKey`.
 
+## Muse video (`internal/provider/muse/video.go`, type `muse`)
+
+- Muse always renders a ~10s mp4 and has no duration/aspect/resolution/audio/watermark controls. `seconds` (non-0), `size`/`ratio` (non-`auto`), `resolution` (non-empty), `generate_audio`/`watermark` (present) are **dropped, not rejected** — Infinite Canvas' OpenAI template sends `seconds=8,size=1280x720,resolution_name=720p,generate_audio=true,watermark=false` by default, and rejecting made every Canvas call fail.
+- The adapter reports the dropped names through the optional `provider.VideoParamIgnorer` (`IgnoredVideoParams`); `buildVideoInput` never reads those fields, so the submitted body is identical to one without them (`TestVideoIgnoresUnsupportedControls`). The handler writes the names to `request_logs.params.ignored` — the adapter itself does not log.
+- Other checks still fail fast: empty prompt, reference-image limits, etc.
+
 ## Rules for adapters
 
 - Get HTTP clients from `Call` (`c.HTTP` for vendor calls, `c.Stream` for unbounded downloads, `c.Timeout` for generation deadlines); base URL via `c.BaseURL(def)` (account > provider > default).

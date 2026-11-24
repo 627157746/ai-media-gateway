@@ -552,6 +552,76 @@ func TestRequestLogParams(t *testing.T) {
 	}
 }
 
+// ignoreAd is a video adapter that reports ignored controls (like Muse).
+type ignoreAd struct{ *fakeAd }
+
+func (ignoreAd) Type() string { return "fakeignore" }
+func (ignoreAd) IgnoredVideoParams(r media.VideoRequest) []string {
+	if r.Seconds != "" {
+		return []string{"seconds", "size"}
+	}
+	return nil
+}
+
+func init() { provider.Register("fakeignore", ignoreAd{fake}) }
+
+// Ignored video controls land in request_logs.params["ignored"]; adapters
+// without VideoParamIgnorer (and requests with nothing ignored) get no key.
+func TestVideoIgnoredParamsLogged(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	ctx := context.Background()
+	e.st.CreateProvider(ctx, &store.Provider{ID: "pign", Type: "fakeignore", Enabled: true})
+	e.account(t, "acc-ign", "pign", "key-I")
+	e.st.CreateModel(ctx, &store.Model{ID: "vid-ign", ProviderID: "pign", Kind: media.KindVideo, Upstream: "up/ign", Enabled: true})
+	fake.submitFn = func(c provider.Call, r media.VideoRequest) (media.TaskHandle, error) {
+		return media.TaskHandle(`{}`), nil
+	}
+	canvas := func(model string) map[string]string {
+		return map[string]string{
+			"model": model, "prompt": "p", "seconds": "8", "size": "1280x720",
+			"resolution_name": "720p", "generate_audio": "true", "watermark": "false",
+		}
+	}
+	lastParams := func() map[string]any {
+		t.Helper()
+		logs, _ := e.st.ListRequestLogs(ctx, "", time.Time{}, 10)
+		var p map[string]any
+		if err := json.Unmarshal(logs[0].Params, &p); err != nil {
+			t.Fatalf("params not JSON: %v", err)
+		}
+		return p
+	}
+
+	if rec := e.do(multipartReq(t, "/v1/videos", canvas("vid-ign"), nil)); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	p := lastParams()
+	ig, _ := p["ignored"].([]any)
+	if len(ig) != 2 || ig[0] != "seconds" || ig[1] != "size" {
+		t.Fatalf("ignored: %v", p)
+	}
+	if p["seconds"] != "8" {
+		t.Fatalf("original params should stay: %v", p)
+	}
+
+	// Nothing ignored → no key.
+	if rec := e.do(multipartReq(t, "/v1/videos", map[string]string{"model": "vid-ign", "prompt": "p"}, nil)); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if _, ok := lastParams()["ignored"]; ok {
+		t.Fatal("ignored must be absent when nothing is ignored")
+	}
+
+	// Adapter without VideoParamIgnorer → no key.
+	if rec := e.do(multipartReq(t, "/v1/videos", canvas("vid"), nil)); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if _, ok := lastParams()["ignored"]; ok {
+		t.Fatal("ignored must be absent for adapters without VideoParamIgnorer")
+	}
+}
+
 // A failed request still records the last attempted account in request_logs.
 func TestFailedRequestLogsAccountID(t *testing.T) {
 	e := newEnv(t)

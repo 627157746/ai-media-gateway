@@ -153,40 +153,53 @@ func TestVideoSubmitReferences(t *testing.T) {
 // TestVideoRejectsUnsupportedControls is the core constraint: Muse fixes the
 // output at ~10s mp4 with no aspect ratio, size, resolution or audio switches.
 // Accepting them silently would let the client believe the request took effect.
-func TestVideoRejectsUnsupportedControls(t *testing.T) {
+// TestVideoIgnoresUnsupportedControls: controls Muse lacks are dropped, not
+// rejected — the submitted body equals the one without them, and
+// IgnoredVideoParams names exactly the fields that were set.
+func TestVideoIgnoresUnsupportedControls(t *testing.T) {
+	true_, false_ := true, false
 	cases := []struct {
 		name string
 		req  media.VideoRequest
-		want string
+		want []string
 	}{
-		{"seconds", media.VideoRequest{Prompt: "p", Seconds: "10"}, "10 秒"},
-		{"ratio", media.VideoRequest{Prompt: "p", Ratio: "16:9"}, "ratio"},
-		{"size", media.VideoRequest{Prompt: "p", Size: "1280x720"}, "size"},
-		{"resolution", media.VideoRequest{Prompt: "p", Resolution: "1080p"}, "resolution"},
+		{"seconds", media.VideoRequest{Prompt: "p", Seconds: "10"}, []string{"seconds"}},
+		{"ratio", media.VideoRequest{Prompt: "p", Ratio: "16:9"}, []string{"ratio"}},
+		{"size", media.VideoRequest{Prompt: "p", Size: "1280x720"}, []string{"size"}},
+		{"resolution", media.VideoRequest{Prompt: "p", Resolution: "1080p"}, []string{"resolution"}},
+		{"generate_audio", media.VideoRequest{Prompt: "p", GenerateAudio: &true_}, []string{"generate_audio"}},
+		{"watermark", media.VideoRequest{Prompt: "p", Watermark: &false_}, []string{"watermark"}},
+		// Infinite Canvas OpenAI template defaults.
+		{"canvas defaults", media.VideoRequest{
+			Prompt: "p", Seconds: "8", Size: "1280x720", Resolution: "720p",
+			GenerateAudio: &true_, Watermark: &false_,
+		}, []string{"seconds", "size", "resolution", "generate_audio", "watermark"}},
+		// Empty / "auto" / 0 are no-ops and are not reported.
+		{"no-ops", media.VideoRequest{Prompt: "p", Seconds: "0", Ratio: "auto", Size: "AUTO"}, nil},
 	}
+
+	base := &fakeMuseVideo{mp4: []byte("mp4")}
+	if _, err := (Adapter{}).SubmitVideo(context.Background(), vcall(base.server(t)), media.VideoRequest{Prompt: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	wantBody, _ := json.Marshal(base.body)
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if got := (Adapter{}).IgnoredVideoParams(tc.req); strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("ignored = %v, want %v", got, tc.want)
+			}
 			f := &fakeMuseVideo{mp4: []byte("mp4")}
-			srv := f.server(t)
-			_, err := (Adapter{}).SubmitVideo(context.Background(), vcall(srv), tc.req)
-			if err == nil {
-				t.Fatalf("%s must be rejected", tc.name)
+			if _, err := (Adapter{}).SubmitVideo(context.Background(), vcall(f.server(t)), tc.req); err != nil {
+				t.Fatalf("%s should be accepted: %v", tc.name, err)
 			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error should mention %q: %v", tc.want, err)
+			if f.submitCnt != 1 {
+				t.Fatalf("submits = %d", f.submitCnt)
 			}
-			if f.submitCnt != 0 {
-				t.Fatal("nothing should be submitted")
+			if gotBody, _ := json.Marshal(f.body); string(gotBody) != string(wantBody) {
+				t.Fatalf("body leaked ignored controls: %s, want %s", gotBody, wantBody)
 			}
 		})
-	}
-	// "auto" is the documented no-op and must pass.
-	f := &fakeMuseVideo{mp4: []byte("mp4")}
-	srv := f.server(t)
-	if _, err := (Adapter{}).SubmitVideo(context.Background(), vcall(srv), media.VideoRequest{
-		Prompt: "p", Ratio: "auto", Size: "auto",
-	}); err != nil {
-		t.Fatalf("auto should be accepted: %v", err)
 	}
 }
 

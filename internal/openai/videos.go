@@ -273,6 +273,15 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, err)
 		return
 	}
+	// Record controls the adapter accepts but cannot honor, so a clip that
+	// differs from the request (e.g. Muse's fixed ~10s) is traceable in the log.
+	if ig, ok := ad.(provider.VideoParamIgnorer); ok {
+		if names := ig.IgnoredVideoParams(vreq); len(names) > 0 {
+			p := videoParams(vreq)
+			p["ignored"] = names
+			logParams(r, p)
+		}
+	}
 	vg := ad.(provider.VideoGenerator)
 	var handle media.TaskHandle
 	pr, err := h.pool.Do(r.Context(), res, func(ctx context.Context, c provider.Call) error {

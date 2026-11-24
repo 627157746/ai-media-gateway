@@ -84,6 +84,17 @@ type VideoFetcher interface {
 	FetchVideo(ctx context.Context, c Call, resultURL, rangeHeader string) (*http.Response, error)
 }
 
+// VideoParamIgnorer is implemented by adapters that accept a video request but
+// cannot honor some of its controls (Muse always renders a ~10s clip, so
+// seconds/size/resolution have no effect). The adapter drops those fields when
+// submitting; the handler records the returned names under request_logs.params
+// "ignored" so the mismatch stays traceable. Adapters do not log themselves.
+type VideoParamIgnorer interface {
+	// IgnoredVideoParams lists the request fields that were set but will not
+	// take effect, using the OpenAI field names. Empty means nothing ignored.
+	IgnoredVideoParams(r media.VideoRequest) []string
+}
+
 type SpeechGenerator interface {
 	Speak(ctx context.Context, c Call, r media.SpeechRequest) (*media.Audio, error)
 }

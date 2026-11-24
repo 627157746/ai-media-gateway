@@ -54,10 +54,8 @@ func (a Adapter) SubmitVideo(ctx context.Context, c provider.Call, r media.Video
 	if strings.TrimSpace(r.Prompt) == "" {
 		return nil, &media.UpstreamError{Class: media.ClassInvalid, Message: "prompt is required", Final: true}
 	}
-	if err := rejectVideoControls(r); err != nil {
-		return nil, err
-	}
-
+	// Unsupported controls (seconds/size/...) are dropped, not rejected: the
+	// handler logs them via IgnoredVideoParams. buildVideoInput never reads them.
 	body, err := buildVideoInput(r)
 	if err != nil {
 		return nil, err
@@ -157,48 +155,37 @@ func (a Adapter) FetchVideo(ctx context.Context, c provider.Call, resultURL, ran
 	return resp, nil
 }
 
-// rejectVideoControls refuses parameters Muse does not have. Silently dropping
-// them would let a client believe its duration or aspect ratio took effect when
-// the vendor always produces the same ~10s clip.
-func rejectVideoControls(r media.VideoRequest) error {
+// IgnoredVideoParams reports the controls Muse does not have. The vendor always
+// produces the same ~10s clip, so they are dropped rather than rejected (Infinite
+// Canvas sends seconds/size/resolution/generate_audio by default); the handler
+// records the names in request_logs.params so the mismatch stays traceable.
+func (Adapter) IgnoredVideoParams(r media.VideoRequest) []string {
+	return ignoredVideoControls(r)
+}
+
+func ignoredVideoControls(r media.VideoRequest) []string {
+	var out []string
 	if s := strings.TrimSpace(r.Seconds); s != "" {
 		if n, err := strconv.Atoi(s); err != nil || n != 0 {
-			return &media.UpstreamError{
-				Class:   media.ClassInvalid,
-				Final:   true,
-				Message: "Muse 视频时长固定约 10 秒，不支持 seconds 参数",
-			}
-		}
-	}
-	if v := strings.TrimSpace(r.Ratio); v != "" && !strings.EqualFold(v, "auto") {
-		return &media.UpstreamError{
-			Class:   media.ClassInvalid,
-			Final:   true,
-			Message: "Muse 不支持 ratio：画幅请写进 prompt",
+			out = append(out, "seconds")
 		}
 	}
 	if v := strings.TrimSpace(r.Size); v != "" && !strings.EqualFold(v, "auto") {
-		return &media.UpstreamError{
-			Class:   media.ClassInvalid,
-			Final:   true,
-			Message: "Muse 不支持 size：画幅请写进 prompt",
-		}
+		out = append(out, "size")
 	}
-	if v := strings.TrimSpace(r.Resolution); v != "" {
-		return &media.UpstreamError{
-			Class:   media.ClassInvalid,
-			Final:   true,
-			Message: "Muse 不支持 resolution",
-		}
+	if v := strings.TrimSpace(r.Ratio); v != "" && !strings.EqualFold(v, "auto") {
+		out = append(out, "ratio")
 	}
-	if r.GenerateAudio != nil || r.Watermark != nil {
-		return &media.UpstreamError{
-			Class:   media.ClassInvalid,
-			Final:   true,
-			Message: "Muse 不支持 generate_audio / watermark",
-		}
+	if strings.TrimSpace(r.Resolution) != "" {
+		out = append(out, "resolution")
 	}
-	return nil
+	if r.GenerateAudio != nil {
+		out = append(out, "generate_audio")
+	}
+	if r.Watermark != nil {
+		out = append(out, "watermark")
+	}
+	return out
 }
 
 // buildVideoInput maps the request onto Muse's video body. Muse distinguishes a
@@ -240,6 +227,7 @@ func buildVideoInput(r media.VideoRequest) (map[string]any, error) {
 }
 
 var (
-	_ provider.VideoGenerator = Adapter{}
-	_ provider.VideoFetcher   = Adapter{}
+	_ provider.VideoGenerator    = Adapter{}
+	_ provider.VideoFetcher      = Adapter{}
+	_ provider.VideoParamIgnorer = Adapter{}
 )
