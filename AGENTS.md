@@ -26,5 +26,6 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
 - Test: `go test ./...`
 - Vet: `go vet ./...`
 - Run: `gateway.exe` with env `ADMIN_TOKEN` and `MASTER_KEY` required; see `internal/config` for all vars (`LISTEN_ADDR` default `:8090`, `DB_PATH` default `data/gateway.db`).
+- Dev (hot reload): `air` — config in `.air.toml`, rebuilds on `.go`/`.html`/`.js`/`.css` change (frontend assets are `go:embed`ed, so JS edits need a rebuild too). Env comes from an optional `.env` (`env_files`); without it, export `ADMIN_TOKEN`/`MASTER_KEY` in the shell. Build errors go to `.tmp/build-errors.log`. Install once: `go install github.com/air-verse/air@latest`.
 - Shell: Git for Windows is installed at non-default `D:\develop\Git`; the junction `%LOCALAPPDATA%\Programs\Git` → `D:\develop\Git` lets Devin find Git Bash. Without it, `bash` resolves to the WSL stub (no distro installed) and the Trellis hooks in `.claude/settings.json` fail with exit code 1.
 - Only non-stdlib dependency: `modernc.org/sqlite` (pure Go, no cgo; `CGO_ENABLED=0` builds work).
