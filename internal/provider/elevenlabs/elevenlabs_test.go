@@ -1,0 +1,171 @@
+package elevenlabs
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+
+	"ai-media-gateway/internal/media"
+	"ai-media-gateway/internal/provider"
+)
+
+type captured struct {
+	path        string
+	query       url.Values
+	apiKey      string
+	body        map[string]any
+	status      int
+	respBody    []byte
+	respHeaders map[string]string
+}
+
+func fakeEL(t *testing.T, cap *captured) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.path = r.URL.Path
+		cap.query = r.URL.Query()
+		cap.apiKey = r.Header.Get("xi-api-key")
+		_ = json.NewDecoder(r.Body).Decode(&cap.body)
+		for k, v := range cap.respHeaders {
+			w.Header().Set(k, v)
+		}
+		if cap.status == 0 {
+			cap.status = 200
+		}
+		w.WriteHeader(cap.status)
+		w.Write(cap.respBody)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func call(srv *httptest.Server, upstream string) provider.Call {
+	return provider.Call{
+		Provider: provider.ProviderConfig{BaseURL: srv.URL},
+		Account:  provider.AccountConfig{APIKey: "el-key"},
+		Model:    provider.ModelConfig{Upstream: upstream},
+		HTTP:     srv.Client(),
+	}
+}
+
+func TestSpeakBasics(t *testing.T) {
+	cap := &captured{respBody: []byte("mp3-bytes"), respHeaders: map[string]string{"Content-Type": "audio/mpeg"}}
+	srv := fakeEL(t, cap)
+	c := call(srv, "eleven_multilingual_v2")
+	c.Model.Options = json.RawMessage(`{"voices":{"narr":"voice-id-1"}}`)
+	a, err := Adapter{}.Speak(context.Background(), c, media.SpeechRequest{Input: "hi", Voice: "narr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Body.Close()
+	b, _ := io.ReadAll(a.Body)
+	if string(b) != "mp3-bytes" || a.ContentType != "audio/mpeg" {
+		t.Fatalf("audio: %q %q", b, a.ContentType)
+	}
+	if cap.path != "/v1/text-to-speech/voice-id-1" {
+		t.Fatalf("path: %s", cap.path)
+	}
+	if cap.query.Get("output_format") != "mp3_44100_128" {
+		t.Fatalf("format: %v", cap.query)
+	}
+	if cap.apiKey != "el-key" || cap.body["model_id"] != "eleven_multilingual_v2" || cap.body["text"] != "hi" {
+		t.Fatalf("req: %v key=%q", cap.body, cap.apiKey)
+	}
+}
+
+func TestVoiceDefaultAndChain(t *testing.T) {
+	cap := &captured{respBody: []byte("x")}
+	srv := fakeEL(t, cap)
+	// default_voice from provider options (lowest precedence still found)
+	c := call(srv, "m")
+	c.Provider.Options = json.RawMessage(`{"default_voice":"p-voice"}`)
+	if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{Input: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if cap.path != "/v1/text-to-speech/p-voice" {
+		t.Fatalf("path: %s", cap.path)
+	}
+	// empty voice with no default → Invalid
+	c = call(srv, "m")
+	_, err := Adapter{}.Speak(context.Background(), c, media.SpeechRequest{Input: "t"})
+	var ue *media.UpstreamError
+	if !errors.As(err, &ue) || ue.Class != media.ClassInvalid {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestFormatMappingAndInvalid(t *testing.T) {
+	for f, want := range map[string]string{
+		"opus": "opus_48000_128", "pcm": "pcm_24000", "wav": "wav_44100",
+	} {
+		cap := &captured{respBody: []byte("x")}
+		srv := fakeEL(t, cap)
+		c := call(srv, "m")
+		c.Model.Options = json.RawMessage(`{"default_voice":"v"}`)
+		if _, err := (Adapter{}).Speak(context.Background(), c, media.SpeechRequest{Input: "t", Format: f}); err != nil {
+			t.Fatal(err)
+		}
+		if cap.query.Get("output_format") != want {
+			t.Fatalf("%s → %v", f, cap.query)
+		}
+	}
+	cap := &captured{respBody: []byte("x")}
+	srv := fakeEL(t, cap)
+	c := call(srv, "m")
+	c.Model.Options = json.RawMessage(`{"default_voice":"v"}`)
+	_, err := Adapter{}.Speak(context.Background(), c, media.SpeechRequest{Input: "t", Format: "flac"})
+	var ue *media.UpstreamError
+	if !errors.As(err, &ue) || ue.Class != media.ClassInvalid {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestSpeedClampAndMerge(t *testing.T) {
+	cap := &captured{respBody: []byte("x")}
+	srv := fakeEL(t, cap)
+	c := call(srv, "m")
+	c.Model.Options = json.RawMessage(`{"default_voice":"v"}`)
+	_, err := Adapter{}.Speak(context.Background(), c, media.SpeechRequest{
+		Input: "t", Speed: 2.0,
+		Extra: map[string]any{"voice_settings": map[string]any{"stability": 0.5}, "seed": 9},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs, _ := cap.body["voice_settings"].(map[string]any)
+	if vs["speed"] != 1.2 || vs["stability"] != 0.5 {
+		t.Fatalf("voice_settings: %v", vs)
+	}
+	if cap.body["seed"] != float64(9) {
+		t.Fatalf("extra: %v", cap.body)
+	}
+}
+
+func TestErrorMapping(t *testing.T) {
+	// 401 with quota_exceeded detail → Quota
+	cap := &captured{status: 401, respBody: []byte(`{"detail":{"status":"quota_exceeded","message":"out"}}`)}
+	srv := fakeEL(t, cap)
+	c := call(srv, "m")
+	c.Model.Options = json.RawMessage(`{"default_voice":"v"}`)
+	_, err := Adapter{}.Speak(context.Background(), c, media.SpeechRequest{Input: "t"})
+	var ue *media.UpstreamError
+	if !errors.As(err, &ue) || ue.Class != media.ClassQuota {
+		t.Fatalf("quota: %v", err)
+	}
+	// plain 401 → Auth; 429 → RateLimit; 500 → Upstream
+	for st, class := range map[int]media.ErrorClass{401: media.ClassAuth, 429: media.ClassRateLimit, 500: media.ClassUpstream, 422: media.ClassInvalid} {
+		cap := &captured{status: st, respBody: []byte(`{"detail":{"status":"x","message":"m"}}`)}
+		srv := fakeEL(t, cap)
+		c2 := call(srv, "m")
+		c2.Model.Options = json.RawMessage(`{"default_voice":"v"}`)
+		_, err := Adapter{}.Speak(context.Background(), c2, media.SpeechRequest{Input: "t"})
+		if !errors.As(err, &ue) || ue.Class != class {
+			t.Fatalf("%d: %v want %v", st, err, class)
+		}
+	}
+}

@@ -1,0 +1,57 @@
+# Provider Adapters
+
+> `internal/provider/<type>/` — one package per vendor, registered via `init()` + `provider.Register`. Shared helpers live in `internal/provider/{httputil,voice}.go`; vendor-neutral types in `internal/media/media.go`.
+
+---
+
+## fal (`internal/provider/fal/fal.go`, type `fal`)
+
+Queue protocol — **always use the URLs fal returns**, never recompute them:
+
+- `POST {base|https://queue.fal.run}/{upstreamModel}` with `Authorization: Key <apiKey>` → `{request_id,status_url,response_url,cancel_url}` → `handle` (the `media.TaskHandle` JSON).
+- Poll `status_url`: `IN_QUEUE`→queued, `IN_PROGRESS`→in_progress, `COMPLETED`→fetch `response_url`. **COMPLETED is not success** — failed/cancelled requests report COMPLETED too; a non-2xx result or a non-empty `error` field in the status means failure.
+- On ctx cancel/timeout: best-effort `PUT cancel_url` with the `Key` auth header and a detached 5s ctx (`cancelBestEffort`; verified in `TestCancelOnCtxCancel`).
+- Polling cadence `pollInterval` (1.5s): transient non-Final `ClassUpstream`/`ClassRateLimit` poll errors retry (RetryAfter honored) up to 5 consecutive; other classes abort; own `Call.Timeout` expiry → Final `ClassUpstream` "fal request <id> timed out after <d>".
+
+### Model `options` schema (`modelOpts`)
+
+```json
+{
+  "upstream_image": "…", "upstream_reference": "…", "upstream_edit": "…",
+  "defaults": {"seed": 42},
+  "fields": {"size_mode": "aspect_ratio", "duration_format": "{n}s", "quality": "output_quality", "num_images": ""},
+  "drop": ["seed"]
+}
+```
+
+- **Endpoint selection**: video — `mode=="reference"` && `upstream_reference`; else (FirstFrame or References) && `upstream_image`; else `Upstream`. Image edit — `upstream_edit` if set else `Upstream` (`videoEndpoint`, `GenerateImage`).
+- **Input build order**: `defaults` → mapped request fields → `Extra` merge → `drop` deletes (`modelOpts.finish`). `fields` maps logical keys to vendor field names; **a field mapped to `""` is omitted** (`modelOpts.field`).
+- Image mapping: `prompt`; `N>0`→`num_images`; `size` via `fields.size_mode` (`image_size` default → `{width,height}` from `WxH`, `aspect_ratio` → nearest of the 11-value list, `none`/`auto` → omit); `resolution`; `quality`/`background` only when their `fields` names are configured; edit images → `fields.images` (default `image_urls`), mask → `mask_url`.
+- Video mapping: `prompt`; `seconds` → `fields.duration` (default `duration`) formatted by `fields.duration_format` (`string`→`"5"`, `int`→`5`, `{n}s`→`"5s"`); `ratio` else `size` → nearest `aspect_ratio` of 6 values (`auto`/empty → omit); `resolution` lowercased; `generate_audio` only when the pointer is non-nil; `watermark` only if `fields.watermark` configured; `first_frame`→`image_url`, `last_frame`→`end_image_url`, `references`→`image_urls`, `videos[0]`→`video_url`, `audios[0]`→`audio_url`.
+- Speech mapping: `input`→`text`, resolved voice→`voice`, `speed>0`→`speed`.
+- **Result extraction** walks decoded JSON: images = every `url` in `images[]` else `image.url`; video = `video.url` else first `url` anywhere; audio = `audio.url`/`audio_file.url` else first `url`. No URL → Final `ClassUpstream` "no <kind> url".
+- `Speak` downloads the result via `FetchURL` with `c.Stream` (unbounded client) and returns the upstream `Content-Type` (extension fallback via `contentTypeFor`).
+
+## ElevenLabs (`internal/provider/elevenlabs/elevenlabs.go`, type `elevenlabs`, speech only)
+
+- `POST {base|https://api.elevenlabs.io}/v1/text-to-speech/{url-escaped voice}?output_format=X`, `xi-api-key` header, JSON body `{"text","model_id":<Upstream>}`.
+- `speed` → `voice_settings.speed` clamped `[0.7,1.2]`; `extra` merges top-level (a `voice_settings` object in `extra` gets speed merged in, not overwritten). `instructions` ignored.
+- `output_format`: `""`/`mp3`→`mp3_44100_128`, `opus`→`opus_48000_128`, `pcm`→`pcm_24000`, `wav`→`wav_44100`; anything else → `ClassInvalid`.
+- Returns `Audio{Body: resp.Body}` — streamed, not buffered.
+
+## Fish Audio (`internal/provider/fishaudio/fishaudio.go`, type `fishaudio`, speech only)
+
+- `POST {base|https://api.fish.audio}/v1/tts`, `Authorization: Bearer <key>`, extra header `model: <Upstream>`.
+- Body `{"text","format","reference_id"? (resolved voice, omitted if empty),"prosody":{"speed"} if >0}` + `extra` top-level.
+- `format`: `""`/`mp3`,`wav`,`pcm`,`opus`; else `ClassInvalid`.
+
+## Voice resolution (`provider/voice.go` `ResolveVoice`)
+
+`ResolveVoice(call, voice)`: if `voice` non-empty, look it up in the `voices` alias map of **account options → model options → provider options** (first hit wins); if `voice` empty, use `default_voice` from the same chain; else return `voice` unchanged. ElevenLabs with no resolvable voice → `ClassInvalid` "voice is required …".
+
+## Rules for adapters
+
+- Get HTTP clients from `Call` (`c.HTTP` for vendor calls, `c.Stream` for unbounded downloads, `c.Timeout` for generation deadlines); base URL via `c.BaseURL(def)` (account > provider > default).
+- Classify every non-2xx per `error-handling.md`; use `TransportError`, `ReadErrorBody`, `ParseRetryAfter`, `FetchURL` from `httputil.go`.
+- **Post-submit errors are `Final`** — see `error-handling.md` §Final; never let a paid job's failure look retryable.
+- Tests: httptest fake vendor in the same package (`fakeQueue`/`captured` fixtures); cover request shape, headers, voice/format mapping, and each error class.
