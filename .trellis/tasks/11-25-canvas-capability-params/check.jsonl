@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/openai-api.md", "reason": "核对画布发出的字段名与网关契约一致"}
+{"file": "infinite-canvas/AGENTS.md", "reason": "核对画布代码风格、主题使用、文档同步是否符合画布规范"}
+{"file": ".trellis/tasks/11-25-canvas-capability-params/prd.md", "reason": "按验收清单逐项核对"}

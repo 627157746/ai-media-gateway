@@ -68,6 +68,30 @@ func adapter(res accounts.Resolved, kind string) (provider.Adapter, error) {
 	return nil, fmt.Errorf("%w: provider type %s does not support %s", media.ErrWrongKind, res.Provider.Type, kind)
 }
 
+// DryRunSetting is the settings key of the 试运行 switch: "1" means generation
+// requests are parsed, validated and logged but never sent upstream.
+const DryRunSetting = "dry_run"
+
+// dryRun reports whether the request was answered by dry-run mode. It runs
+// after params are logged and the model/adapter resolved, right before the
+// upstream call, so request_logs shows exactly what would have been sent.
+func (h *handler) dryRun(w http.ResponseWriter, r *http.Request) bool {
+	v, err := h.st.GetSetting(r.Context(), DryRunSetting)
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return true
+	}
+	if v != "1" {
+		return false
+	}
+	const msg = "试运行模式：参数已记录到请求日志，未发送上游（在 设置 → 试运行 关闭）"
+	if l := httpx.Log(r.Context()); l != nil {
+		l.Error = msg
+	}
+	httpx.Error(w, http.StatusBadRequest, msg, "invalid_request_error", "dry_run")
+	return true
+}
+
 // logFill annotates the request-log entry (nil-safe).
 func logFill(r *http.Request, modelID string, res *accounts.Resolved, result *accounts.Result) {
 	l := httpx.Log(r.Context())

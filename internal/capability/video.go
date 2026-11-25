@@ -66,6 +66,10 @@ type VideoSpec struct {
 	SupportsAudio bool `json:"supports_audio"`
 	// SupportsNegativePrompt means a negative prompt field exists.
 	SupportsNegativePrompt bool `json:"supports_negative_prompt,omitempty"`
+	// ValueLabels gives the Chinese display text for declared enum values,
+	// keyed by logical field (ratio, resolution). Filled by WithLabels when
+	// serving /v1/models; unlabelled values are absent.
+	ValueLabels map[string]map[string]string `json:"value_labels,omitempty"`
 }
 
 // videoDefaults is what an endpoint with no readable schema can promise. It is

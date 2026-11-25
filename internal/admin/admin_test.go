@@ -427,10 +427,23 @@ func TestSettingsAndProxyURL(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("get settings: %d", rec.Code)
 	}
-	var s map[string]string
+	var s map[string]any
 	e.json(rec, &s)
-	if s["proxy_url"] != "" {
-		t.Fatalf("initial proxy_url: %q", s["proxy_url"])
+	if s["proxy_url"] != "" || s["dry_run"] != false {
+		t.Fatalf("initial settings: %v", s)
+	}
+	// dry_run toggles independently of proxy_url
+	rec = e.do("PATCH", "/admin/settings", `{"dry_run":true}`)
+	s = nil
+	e.json(rec, &s)
+	if rec.Code != 200 || s["dry_run"] != true || s["proxy_url"] != "" {
+		t.Fatalf("dry_run on: %d %s", rec.Code, rec.Body)
+	}
+	rec = e.do("PATCH", "/admin/settings", `{"dry_run":false}`)
+	s = nil
+	e.json(rec, &s)
+	if rec.Code != 200 || s["dry_run"] != false {
+		t.Fatalf("dry_run off: %d %s", rec.Code, rec.Body)
 	}
 	rec = e.do("PATCH", "/admin/settings", `{"proxy_url":"socks5://u:p@127.0.0.1:1080"}`)
 	e.json(rec, &s)

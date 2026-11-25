@@ -1,10 +1,29 @@
 import { admin } from '../api.js';
-import { h, field, proxyField, toast, errMsg, openSheet, sheetButtons, confirmDialog, invalidateProxies } from '../ui.js';
+import { h, field, proxyField, toast, errMsg, openSheet, sheetButtons, confirmDialog, invalidateProxies, switchEl } from '../ui.js';
 
 export function mountSettings(root) {
   const err = h('div', { class: 'err-text' });
   const poolCard = h('div', { class: 'card' });
   const proxy = proxyField('', '跟随系统环境变量（默认）');
+  const dryErr = h('div', { class: 'err-text' });
+  const dryBox = h('span');
+  function renderDry(on) {
+    dryBox.textContent = '';
+    dryBox.append(switchEl(on, async v => {
+      dryErr.textContent = '';
+      try {
+        const s = await admin('/admin/settings', { method: 'PATCH', json: { dry_run: v } });
+        renderDry(!!s.dry_run);
+        toast(s.dry_run ? '试运行已开启：生成请求不会发往上游' : '试运行已关闭', 'ok');
+      } catch (e) { dryErr.textContent = errMsg(e); renderDry(!v); }
+    }, '开启试运行'));
+  }
+  renderDry(false);
+  root.append(h('div', { class: 'card' },
+    h('div', { class: 'card-head' }, h('span', { class: 'title', text: '试运行' })),
+    dryBox,
+    h('div', { class: 'muted fs12 mt16', text: '开启后，生图/视频/语音请求只做解析、校验并写入请求日志，不发往上游、不消耗额度，直接返回 400（code: dry_run）。参数可在 请求日志 → 详情 查看。测完记得关闭。' }),
+    dryErr));
   root.append(poolCard, h('div', { class: 'card' },
     h('div', { class: 'card-head' }, h('span', { class: 'title', text: '全局代理' })),
     field('代理', proxy.el, '所有上游请求默认走这个代理'),
@@ -25,6 +44,7 @@ export function mountSettings(root) {
     try {
       const [s, ps] = await Promise.all([admin('/admin/settings'), admin('/admin/proxies')]);
       proxy.set(s.proxy_url || '');
+      renderDry(!!s.dry_run);
       renderPool(ps.proxies || []);
     } catch (e) { err.textContent = errMsg(e); }
   }

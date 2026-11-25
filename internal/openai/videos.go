@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ai-media-gateway/internal/accounts"
+	"ai-media-gateway/internal/capability"
 	"ai-media-gateway/internal/httpx"
 	"ai-media-gateway/internal/media"
 	"ai-media-gateway/internal/provider"
@@ -201,19 +202,20 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 			httpx.Fail(w, r, err)
 			return
 		}
-		refs, err := collectInputs(r, "image", "image[]", "input_reference[]")
+		// The plural names mirror the JSON body's images/videos/audios keys.
+		refs, err := collectInputs(r, "image", "image[]", "images", "images[]", "input_reference[]")
 		if err != nil {
 			httpx.Fail(w, r, err)
 			return
 		}
 		vreq.References = refs
-		vids, err := collectInputs(r, "video", "video[]", "video_reference[]")
+		vids, err := collectInputs(r, "video", "video[]", "videos", "videos[]", "video_reference[]")
 		if err != nil {
 			httpx.Fail(w, r, err)
 			return
 		}
 		vreq.Videos = vids
-		auds, err := collectInputs(r, "audio", "audio[]", "audio_reference[]")
+		auds, err := collectInputs(r, "audio", "audio[]", "audios", "audios[]", "audio_reference[]")
 		if err != nil {
 			httpx.Fail(w, r, err)
 			return
@@ -277,6 +279,14 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, err)
 		return
 	}
+	// requires_images (model options or the endpoint schema's required image)
+	// means the model only animates supplied images. Reject a prompt-only
+	// request here: forwarded, it fails upstream after queueing (and may bill).
+	if capability.VideoFromOptions(res.Provider.Type, res.Model.Upstream, res.Model.Options).RequiresImages &&
+		vreq.FirstFrame == nil && vreq.LastFrame == nil && len(vreq.References) == 0 {
+		httpx.Fail(w, r, bad("模型 %s 只支持图生视频：请传首帧或参考图（image / first_frame / input_reference）", in.Model))
+		return
+	}
 	ad, err := adapter(res, "video")
 	if err != nil {
 		httpx.Fail(w, r, err)
@@ -290,6 +300,9 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 			p["ignored"] = names
 			logParams(r, p)
 		}
+	}
+	if h.dryRun(w, r) {
+		return
 	}
 	vg := ad.(provider.VideoGenerator)
 	var handle media.TaskHandle

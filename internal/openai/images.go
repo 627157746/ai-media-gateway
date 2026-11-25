@@ -167,6 +167,9 @@ func (h *handler) runImage(w http.ResponseWriter, r *http.Request, modelID strin
 		httpx.Fail(w, r, err)
 		return
 	}
+	if h.dryRun(w, r) {
+		return
+	}
 	gen := ad.(provider.ImageGenerator)
 	var result *media.ImageResult
 	var stream *http.Client
@@ -256,7 +259,7 @@ func (h *handler) listModels(w http.ResponseWriter, r *http.Request) {
 			// parameters. The hand-declared table is the fallback.
 			entry["capabilities"] = capability.ImageFromSchemaForKinds(
 				h.imageSchema(r.Context(), m, prov),
-				prov.Type, m.Upstream, m.Options)
+				prov.Type, m.Upstream, m.Options).WithLabels()
 		case media.KindVideo:
 			// Video capabilities come from the endpoint schema when the vendor
 			// publishes one, because the two modes (first-frame animation vs
@@ -265,7 +268,7 @@ func (h *handler) listModels(w http.ResponseWriter, r *http.Request) {
 			if raw := h.videoSchema(r.Context(), m, prov); raw != nil {
 				vs = *raw
 			}
-			entry["capabilities"] = capability.VideoFromSchema(vs, prov.Type, m.Upstream, m.Options)
+			entry["capabilities"] = capability.VideoFromSchema(vs, prov.Type, m.Upstream, m.Options).WithLabels()
 		case media.KindSpeech:
 			entry["capabilities"] = capability.FromOptions(prov.Type, m.Options)
 		}

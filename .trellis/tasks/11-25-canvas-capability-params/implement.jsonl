@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/openai-api.md", "reason": "网关 /v1/* 对外契约：/v1/models 的 capabilities 字段、/v1/audio/voices 返回结构、视频 multipart 字段名"}
+{"file": "infinite-canvas/AGENTS.md", "reason": "画布仓库自身规范：前端目录约定、画布主题、文档同步要求、改动前需授权、不跑构建"}
+{"file": ".trellis/tasks/11-25-canvas-capability-params/design.md", "reason": "本任务技术设计"}

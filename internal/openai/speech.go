@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"ai-media-gateway/internal/accounts"
+	"ai-media-gateway/internal/capability"
 	"ai-media-gateway/internal/httpx"
 	"ai-media-gateway/internal/media"
 	"ai-media-gateway/internal/provider"
@@ -81,6 +82,12 @@ func (h *handler) speech(w http.ResponseWriter, r *http.Request) {
 			voiceResolved = true
 		}
 	}
+	spec := capability.FromOptions(res.Provider.Type, res.Model.Options)
+	if err := h.checkVoice(r.Context(), res, spec, in.Voice, voiceResolved, refAudio != nil); err != nil {
+		logParams(r, map[string]any{"voice": in.Voice})
+		httpx.Fail(w, r, err)
+		return
+	}
 
 	sreq := media.SpeechRequest{
 		Input:          in.Input,
@@ -96,6 +103,9 @@ func (h *handler) speech(w http.ResponseWriter, r *http.Request) {
 	ad, err := adapter(res, "speech")
 	if err != nil {
 		httpx.Fail(w, r, err)
+		return
+	}
+	if h.dryRun(w, r) {
 		return
 	}
 	sp := ad.(provider.SpeechGenerator)

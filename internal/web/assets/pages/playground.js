@@ -48,57 +48,12 @@ export function mountPlayground(root) {
   function resultBox() { return h('div', { class: 'result-media mt14' }); }
 
 // Vendors name their parameters in English, which the admin UI has no reason to
-// expose raw. These maps turn the vendor's enum values into Chinese labels while
-// the request keeps sending the original value.
-const VALUE_LABELS = {
-  // fal's image_size presets describe a SHAPE, so the label is the aspect ratio
-  // itself. The two square presets both mean 1:1 and differ only in resolution,
-  // so they get a 大/小 hint; no pixel count is shown because the vendor
-  // documents the ratio but not the size per preset.
-  size: {
-    auto: '自动',
-    square_hd: '1:1（大）',
-    square: '1:1（小）',
-    portrait_4_3: '3:4',
-    portrait_16_9: '9:16',
-    landscape_4_3: '4:3',
-    landscape_16_9: '16:9',
-    // Some vendors encode the resolution TIER inside image_size instead of
-    // exposing a separate resolution field, so 1K/1.5K/2K appear here.
-    auto_1K: '自动 · 1K',
-    'auto_1.5K': '自动 · 1.5K',
-    auto_2K: '自动 · 2K',
-    auto_4K: '自动 · 4K',
-    '1024x1024': '1:1（1024×1024）',
-    '1024x1536': '2:3（1024×1536）',
-    '1536x1024': '3:2（1536×1024）',
-  },
-  quality: {
-    auto: '自动', low: '低', medium: '中', high: '高',
-    xhigh: '超高', max: '最高',
-  },
-  background: { auto: '自动', transparent: '透明', opaque: '不透明' },
-  format: {
-    png: 'PNG（无损）', jpg: 'JPG（有损）', jpeg: 'JPEG（有损）',
-    webp: 'WebP（体积小）', gif: 'GIF（动图）', svg: 'SVG（矢量）',
-  },
-  resolution: {
-    '1K': '1K', '1.5K': '1.5K', '2K': '2K', '4K': '4K',
-    '480P': '480P 流畅', '720P': '720P 高清', '768P': '768P 高清',
-    '1080P': '1080P 全高清',
-  },
-  ratio: {
-    auto: '自动', adaptive: '自适应（跟随输入）',
-    '16:9': '16:9', '9:16': '9:16', '4:3': '4:3',
-    '3:4': '3:4', '1:1': '1:1', '21:9': '21:9', '9:21': '9:21',
-  },
-  duration: {},
-};
-
-// valueLabel decides how an option is displayed; the underlying value stays as
-// the vendor expects, so nothing English leaks into the request.
-function valueLabel(kind, v) {
-  const m = VALUE_LABELS[kind] || {};
+// expose raw. The Chinese labels come from the gateway itself
+// (capabilities.value_labels on GET /v1/models), so the admin playground and the
+// canvas share one table. The request keeps sending the original value; a value
+// with no label is shown as-is.
+function valueLabel(cap, kind, v) {
+  const m = ((cap && cap.value_labels) || {})[kind] || {};
   return m[v] || v;
 }
 
@@ -139,7 +94,7 @@ function valueLabel(kind, v) {
       if (def) {
         sel.append(h('option', {
           value: '',
-          text: `跟随模型默认（${valueLabel(kind, def)}）`,
+          text: `跟随模型默认（${valueLabel(cap, kind, def)}）`,
         }));
       } else {
         sel.append(h('option', { value: '', text: '跟随模型默认' }));
@@ -148,7 +103,7 @@ function valueLabel(kind, v) {
         const isDef = def && v === def;
         sel.append(h('option', {
           value: v,
-          text: valueLabel(kind, v) + (isDef ? '（模型默认）' : ''),
+          text: valueLabel(cap, kind, v) + (isDef ? '（模型默认）' : ''),
         }));
       }
       sel.disabled = values.length === 0;
@@ -326,8 +281,8 @@ function valueLabel(kind, v) {
     const MODE_LABEL = { frames: '图生视频（image-to-video）', reference: '参考生视频（reference-to-video）' };
     const fmtOpt = (sel, values, kind, def) => {
       sel.textContent = '';
-      sel.append(h('option', { value: '', text: def ? `默认：${valueLabel(kind, def)}` : '默认' }));
-      for (const v of values) sel.append(h('option', { value: v, text: valueLabel(kind, v) }));
+      sel.append(h('option', { value: '', text: def ? `默认：${valueLabel(cap, kind, def)}` : '默认' }));
+      for (const v of values) sel.append(h('option', { value: v, text: valueLabel(cap, kind, v) }));
       sel.disabled = values.length === 0;
     };
 

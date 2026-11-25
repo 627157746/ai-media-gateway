@@ -1033,3 +1033,63 @@ func TestVideoURLForAuthedResult(t *testing.T) {
 		t.Fatalf("content: %d %q", rec.Code, rec.Body)
 	}
 }
+
+// TestDryRunSkipsUpstream: with the 试运行 switch on, generation requests are
+// validated and logged (params included) but no adapter call happens.
+func TestDryRunSkipsUpstream(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	ctx := context.Background()
+	if err := e.st.SetSetting(ctx, openai.DryRunSetting, "1"); err != nil {
+		t.Fatal(err)
+	}
+	var calls int32
+	fake.imgFn = func(c provider.Call, r media.ImageRequest) (*media.ImageResult, error) {
+		atomic.AddInt32(&calls, 1)
+		return &media.ImageResult{}, nil
+	}
+	fake.submitFn = func(c provider.Call, r media.VideoRequest) (media.TaskHandle, error) {
+		atomic.AddInt32(&calls, 1)
+		return media.TaskHandle(`{}`), nil
+	}
+	fake.speakFn = func(c provider.Call, r media.SpeechRequest) (*media.Audio, error) {
+		atomic.AddInt32(&calls, 1)
+		return &media.Audio{Body: io.NopCloser(strings.NewReader("A"))}, nil
+	}
+	reqs := []struct {
+		path string
+		body map[string]any
+	}{
+		{"/v1/images/generations", map[string]any{"model": "img", "prompt": "p", "size": "1024x1024"}},
+		{"/v1/videos", map[string]any{"model": "vid", "prompt": "p", "seconds": "5"}},
+		{"/v1/audio/speech", map[string]any{"model": "tts", "input": "hi", "voice": "v1"}},
+	}
+	for _, rq := range reqs {
+		rec := e.jsonReq("POST", rq.path, rq.body)
+		if rec.Code != 400 || !strings.Contains(rec.Body.String(), `"dry_run"`) {
+			t.Fatalf("%s: %d %s", rq.path, rec.Code, rec.Body)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 0 {
+		t.Fatalf("adapter called %d times in dry run", n)
+	}
+	logs, err := e.st.ListRequestLogs(ctx, "", time.Time{}, 10)
+	if err != nil || len(logs) != 3 {
+		t.Fatalf("logs: %v %d", err, len(logs))
+	}
+	for _, l := range logs {
+		if len(l.Params) == 0 || !strings.Contains(l.Error, "试运行") || l.ModelID == "" {
+			t.Fatalf("log entry: %+v params=%s", l, l.Params)
+		}
+	}
+
+	// switched off → requests reach the adapter again
+	e.st.SetSetting(ctx, openai.DryRunSetting, "")
+	fake.imgFn = func(c provider.Call, r media.ImageRequest) (*media.ImageResult, error) {
+		atomic.AddInt32(&calls, 1)
+		return &media.ImageResult{Images: []media.Asset{{URL: "https://cdn/i.png"}}}, nil
+	}
+	if rec := e.jsonReq("POST", "/v1/images/generations", reqs[0].body); rec.Code != 200 || atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("after off: %d %s calls=%d", rec.Code, rec.Body, calls)
+	}
+}

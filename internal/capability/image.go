@@ -51,6 +51,12 @@ type ImageSpec struct {
 	// client cannot tell which option applies when the user leaves a control
 	// alone, and "默认" alone does not say what the default is.
 	Defaults map[string]string `json:"defaults,omitempty"`
+
+	// ValueLabels gives the Chinese display text for declared enum values,
+	// keyed by logical field (size, quality, resolution, background, format).
+	// Filled by WithLabels when serving /v1/models; unlabelled values are absent
+	// and clients show them as-is.
+	ValueLabels map[string]map[string]string `json:"value_labels,omitempty"`
 }
 
 // imageDefaults is the shape given to a provider we have no schema for. It is

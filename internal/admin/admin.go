@@ -916,15 +916,35 @@ func (h *handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]string{"proxy_url": proxy})
+	dry, err := h.st.GetSetting(r.Context(), dryRunSetting)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"proxy_url": proxy, "dry_run": dry == "1"})
 }
+
+// dryRunSetting mirrors openai.DryRunSetting (试运行: generation requests are
+// logged but not sent upstream).
+const dryRunSetting = "dry_run"
 
 func (h *handler) patchSettings(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		ProxyURL *string `json:"proxy_url"`
+		DryRun   *bool   `json:"dry_run"`
 	}
 	if !readJSON(w, r, &in) {
 		return
+	}
+	if in.DryRun != nil {
+		v := ""
+		if *in.DryRun {
+			v = "1"
+		}
+		if err := h.st.SetSetting(r.Context(), dryRunSetting, v); err != nil {
+			fail(w, err)
+			return
+		}
 	}
 	if in.ProxyURL != nil {
 		v := strings.TrimSpace(*in.ProxyURL)
