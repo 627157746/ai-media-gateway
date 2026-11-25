@@ -352,6 +352,42 @@ func firstFile(r *http.Request, names ...string) (*media.Input, error) {
 	return &files[0], nil
 }
 
+// collectInputs is collectFiles plus plain form values: a field may carry an
+// uploaded file or a data:/http(s) URL string (Infinite Canvas sends public
+// references as URLs). URLs pass through to the vendor, never fetched.
+func collectInputs(r *http.Request, names ...string) ([]media.Input, error) {
+	if r.MultipartForm == nil {
+		return nil, nil
+	}
+	var out []media.Input
+	for _, name := range names {
+		files, err := collectFiles(r, name)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, files...)
+		for _, v := range r.MultipartForm.Value[name] {
+			if v = strings.TrimSpace(v); v == "" {
+				continue
+			}
+			in, err := parseInputString(v)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, in)
+		}
+	}
+	return out, nil
+}
+
+func firstInput(r *http.Request, names ...string) (*media.Input, error) {
+	ins, err := collectInputs(r, names...)
+	if err != nil || len(ins) == 0 {
+		return nil, err
+	}
+	return &ins[0], nil
+}
+
 func parseN(v any, def int) (int, error) {
 	if v == nil {
 		return def, nil

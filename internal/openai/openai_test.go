@@ -865,3 +865,171 @@ func TestSpeechVoiceWrongProvider(t *testing.T) {
 		t.Fatalf("ghost: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// Infinite Canvas (OpenAI channel) multipart field names: input_reference[],
+// first_frame_url, last_frame_url, video_reference[], audio_reference[],
+// video_generate_audio — each media field as an uploaded file.
+func TestVideoMultipartInfiniteCanvasFiles(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	fake.submitFn = func(c provider.Call, r media.VideoRequest) (media.TaskHandle, error) {
+		return media.TaskHandle(`{}`), nil
+	}
+	fake.videoReqs = nil
+	rec := e.do(multipartReq(t, "/v1/videos", map[string]string{
+		"model": "vid", "prompt": "p", "seconds": "5", "size": "1280x720",
+		"resolution_name": "720p", "preset": "normal", "video_generate_audio": "true",
+	}, map[string][][]byte{
+		"input_reference[]": {[]byte("R1"), []byte("R2")},
+		"first_frame_url":   {[]byte("FF")},
+		"last_frame_url":    {[]byte("LF")},
+		"video_reference[]": {[]byte("VD")},
+		"audio_reference[]": {[]byte("AU")},
+	}))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	r := fake.videoReqs[0]
+	if r.Mode != "frames" || r.GenerateAudio == nil || !*r.GenerateAudio {
+		t.Fatalf("mode/audio: %+v", r)
+	}
+	if r.FirstFrame == nil || string(r.FirstFrame.Data) != "FF" || r.LastFrame == nil || string(r.LastFrame.Data) != "LF" {
+		t.Fatalf("frames: %+v %+v", r.FirstFrame, r.LastFrame)
+	}
+	if len(r.References) != 2 || string(r.References[0].Data) != "R1" || string(r.References[1].Data) != "R2" {
+		t.Fatalf("refs: %+v", r.References)
+	}
+	if len(r.Videos) != 1 || string(r.Videos[0].Data) != "VD" || len(r.Audios) != 1 || string(r.Audios[0].Data) != "AU" {
+		t.Fatalf("vids=%+v auds=%+v", r.Videos, r.Audios)
+	}
+}
+
+// The same Canvas fields carry public references as URL strings (and may be
+// data URLs); http(s) passes through as Input.URL, data: is decoded.
+func TestVideoMultipartInfiniteCanvasURLs(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	fake.submitFn = func(c provider.Call, r media.VideoRequest) (media.TaskHandle, error) {
+		return media.TaskHandle(`{}`), nil
+	}
+	fake.videoReqs = nil
+	rec := e.do(multipartReq(t, "/v1/videos", map[string]string{
+		"model": "vid", "prompt": "p",
+		"input_reference[]": "https://cdn.example/r.png",
+		"first_frame_url":   "data:image/png;base64,QQ==",
+		"last_frame_url":    "https://cdn.example/l.png",
+		"video_reference[]": "https://cdn.example/v.mp4",
+		"audio_reference[]": "https://cdn.example/a.mp3",
+	}, nil))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	r := fake.videoReqs[0]
+	if r.FirstFrame == nil || string(r.FirstFrame.Data) != "A" || r.LastFrame == nil || r.LastFrame.URL != "https://cdn.example/l.png" {
+		t.Fatalf("frames: %+v %+v", r.FirstFrame, r.LastFrame)
+	}
+	if len(r.References) != 1 || r.References[0].URL != "https://cdn.example/r.png" {
+		t.Fatalf("refs: %+v", r.References)
+	}
+	if len(r.Videos) != 1 || r.Videos[0].URL != "https://cdn.example/v.mp4" || len(r.Audios) != 1 || r.Audios[0].URL != "https://cdn.example/a.mp3" {
+		t.Fatalf("vids=%+v auds=%+v", r.Videos, r.Audios)
+	}
+}
+
+// Canvas never sends mode: one input_reference[] becomes the first frame, and
+// an explicit generate_audio beats the video_generate_audio alias.
+func TestVideoMultipartInfiniteCanvasSingleRef(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	fake.submitFn = func(c provider.Call, r media.VideoRequest) (media.TaskHandle, error) {
+		return media.TaskHandle(`{}`), nil
+	}
+	fake.videoReqs = nil
+	rec := e.do(multipartReq(t, "/v1/videos", map[string]string{
+		"model": "vid", "prompt": "p", "generate_audio": "false", "video_generate_audio": "true",
+	}, map[string][][]byte{"input_reference[]": {[]byte("R1")}}))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	r := fake.videoReqs[0]
+	if r.Mode != "frames" || r.FirstFrame == nil || string(r.FirstFrame.Data) != "R1" || len(r.References) != 0 {
+		t.Fatalf("single ref: %+v", r)
+	}
+	if r.GenerateAudio == nil || *r.GenerateAudio {
+		t.Fatalf("generate_audio must win: %v", r.GenerateAudio)
+	}
+}
+
+// fetchAd is a video adapter whose results need vendor auth (provider.VideoFetcher).
+type fetchAd struct{ *fakeAd }
+
+func (fetchAd) Type() string { return "fakefetch" }
+func (fetchAd) FetchVideo(_ context.Context, _ provider.Call, _, _ string) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("V"))}, nil
+}
+
+func init() { provider.Register("fakefetch", fetchAd{fake}) }
+
+// A completed task on a VideoFetcher provider exposes the gateway's own
+// /content link (the vendor URL needs a key the client lacks); plain CDN
+// results keep the vendor URL.
+func TestVideoURLForAuthedResult(t *testing.T) {
+	e := newEnv(t)
+	seedVideo(t, e)
+	ctx := context.Background()
+	e.st.CreateProvider(ctx, &store.Provider{ID: "pf", Type: "fakefetch", Enabled: true})
+	e.account(t, "acc-f", "pf", "key-F")
+	e.st.CreateModel(ctx, &store.Model{ID: "vid-f", ProviderID: "pf", Kind: media.KindVideo, Upstream: "up/f", Enabled: true})
+	e.st.CreateVideoTask(ctx, &store.VideoTask{
+		ID: "video_f", ModelID: "vid-f", ProviderID: "pf", AccountID: "acc-f",
+		Handle: media.TaskHandle(`{}`), Status: media.TaskCompleted, Progress: 100,
+		ResultURL: "https://vendor.example/jobs/1/result",
+	})
+	e.st.CreateVideoTask(ctx, &store.VideoTask{
+		ID: "video_c", ModelID: "vid", ProviderID: "p1", AccountID: "acc-a",
+		Handle: media.TaskHandle(`{}`), Status: media.TaskCompleted, Progress: 100,
+		ResultURL: "http://cdn/v.mp4",
+	})
+	get := func(path string, hdr map[string]string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("GET", path, nil)
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		rec := e.do(req)
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
+		}
+		var obj map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &obj)
+		return obj
+	}
+	if u := get("/v1/videos/video_f", nil)["video_url"]; u != "http://example.com/v1/videos/video_f/content" {
+		t.Fatalf("fetcher video_url: %v", u)
+	}
+	fwd := map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "gw.example"}
+	if u := get("/v1/videos/video_f", fwd)["video_url"]; u != "https://gw.example/v1/videos/video_f/content" {
+		t.Fatalf("forwarded video_url: %v", u)
+	}
+	if u := get("/v1/videos/video_c", nil)["video_url"]; u != "http://cdn/v.mp4" {
+		t.Fatalf("cdn video_url: %v", u)
+	}
+	list, _ := get("/v1/videos", nil)["data"].([]any)
+	seen := map[string]any{}
+	for _, it := range list {
+		m := it.(map[string]any)
+		seen[m["id"].(string)] = m["video_url"]
+	}
+	if seen["video_f"] != "http://example.com/v1/videos/video_f/content" || seen["video_c"] != "http://cdn/v.mp4" {
+		t.Fatalf("list: %v", seen)
+	}
+	// stored vendor URL is untouched; /content still serves the bytes
+	row, _ := e.st.GetVideoTask(ctx, "video_f")
+	if row.ResultURL != "https://vendor.example/jobs/1/result" {
+		t.Fatalf("stored url changed: %s", row.ResultURL)
+	}
+	rec := e.do(httptest.NewRequest("GET", "/v1/videos/video_f/content", nil))
+	if rec.Code != 200 || rec.Body.String() != "V" {
+		t.Fatalf("content: %d %q", rec.Code, rec.Body)
+	}
+}

@@ -1,6 +1,6 @@
 # OpenAI API Contract
 
-> The external `/v1/*` surface (`internal/openai/`) — this is what clients (Infinite Canvas) code against. `Infinite Canvas.md` at repo root is the client contract source; keep behavior aligned with it.
+> The external `/v1/*` surface (`internal/openai/`) — this is what clients (Infinite Canvas) code against. The client contract source is the Infinite Canvas OpenAI channel itself (github.com/tigerowo/infinite-canvas, `web/src/services/api/{image,video,audio}.ts`); field names follow it exactly.
 
 ---
 
@@ -37,10 +37,12 @@ Request body size is capped by `MAX_BODY_MB` (100) middleware — multipart uplo
 
 - Accepted fields (both JSON and multipart): `model`, `prompt`, `seconds`, `size`, `resolution` **or** `resolution_name`, `ratio` **or** `aspect_ratio`, `generate_audio`, `watermark` (bool strings `"true"`/`"false"` allowed), `mode`, `extra` (JSON object or JSON string).
 - File/media inputs: `first_frame`, `last_frame`, `image`/`image[]`, `input_reference` (OpenAI field — treated as first frame), `video`/`video[]`, `audio`/`audio[]`; JSON variants `images`, `first_frame`, `last_frame`, `input_reference`, `videos`, `audios` as data-URL or http(s) URL strings. http(s) URLs pass through to the vendor — never fetched (SSRF).
+- **Infinite Canvas OpenAI-channel aliases** (multipart only; source: canvas `web/src/services/api/video.ts` `createVideoRequestBody`, pinned by `TestVideoMultipartInfiniteCanvas*`): `input_reference[]` → references (same as `image[]`), `first_frame_url` → first frame, `last_frame_url` → last frame, `video_reference[]` → videos, `audio_reference[]` → audios, `video_generate_audio` → `generate_audio` (explicit `generate_audio` wins). Canvas sends each media field as either an uploaded file **or** a data-URL / public http(s) URL string, so these fields (and the original multipart media names) are read via `collectInputs`/`firstInput` = files + form values through `parseInputString`. Canvas never sends `mode`, so `normalizeMode` decides (1–2 refs ⇒ `frames`, >2 ⇒ `reference`). Extra canvas fields (`preset`) are ignored.
 - **Mode normalization** (`normalizeMode`, pinned by `TestVideoModeNormalization`): `mode=="frames"` without first/last → `images[0]`→first, `images[1]`→last; `mode==""` → first/last given ⇒ `frames`, >2 images ⇒ `reference`, 1–2 images ⇒ `frames`; `mode=="reference"` → all images (+ first/last if given) become `References`.
 - Adapters implementing `provider.VideoParamIgnorer` (Muse) accept controls they cannot honor; after resolving the adapter, `createVideo` re-logs `videoParams(vreq)` with `ignored: [names]` when the list is non-empty. No response field changes.
 - On `SubmitVideo` success a `video_tasks` row (`id` = `"video_"+24hex`) is bound to the account the pool used → 200 with the task object.
-- **Task object**: `{"id","object":"video","model","status","progress","created_at"(unix s),"completed_at"(unix s|null),"video_url"(only when completed),"error":null|{"message","code"}}`.
+- **Task object**: `{"id","object":"video","model","status","progress","created_at"(unix s),"completed_at"(unix s|null),"video_url"(only when completed),"error":null|{"message","code"}}`. Built by `handler.videoJSON` (never write `videoObject` straight to a response).
+- **`video_url` rule** (`videoJSON`, pinned by `TestVideoURLForAuthedResult`): when the task's provider adapter implements `provider.VideoFetcher` (vendor result needs auth — Muse), `video_url` = `<scheme>://<host>/v1/videos/{id}/content`, scheme/host from `X-Forwarded-Proto`/`X-Forwarded-Host` else `r.TLS`/`r.Host`. Canvas recognizes the `/videos/{id}/content` path and downloads it with its `Authorization` header. Other adapters (fal CDN) return the vendor URL as-is. `video_tasks.result_url` always stores the vendor URL — `/content` downloads from it.
 - `GET /{id}` 404s unknown tasks; transient-class poll failures keep state (`slog.Warn`), others mark `failed`; completed sets `video_url` + `completed_at`.
 - `GET /{id}/content`: completed only else 409 `video_not_ready`; forwards the client's `Range`, copies upstream status (200/206) + `Content-Type/Content-Length/Content-Range/Accept-Ranges`, streams the body.
 

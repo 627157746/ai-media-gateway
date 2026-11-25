@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"ai-media-gateway/internal/accounts"
@@ -143,6 +145,10 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 		in.Ratio = fv("ratio")
 		in.AspectRatio = fv("aspect_ratio")
 		in.GenerateAudio = fv("generate_audio")
+		if fv("generate_audio") == "" {
+			// Infinite Canvas OpenAI channel name.
+			in.GenerateAudio = fv("video_generate_audio")
+		}
 		in.Watermark = fv("watermark")
 		in.Mode = fv("mode")
 		if x := fv("extra"); x != "" {
@@ -174,8 +180,11 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isMultipart {
+		// Infinite Canvas sends input_reference[] / first_frame_url /
+		// last_frame_url / video_reference[] / audio_reference[], each either an
+		// uploaded file or a URL string; both are accepted next to our own names.
 		put := func(dst **media.Input, names ...string) error {
-			f, err := firstFile(r, names...)
+			f, err := firstInput(r, names...)
 			if err != nil {
 				return err
 			}
@@ -184,27 +193,27 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		}
-		if err := put(&vreq.FirstFrame, "first_frame", "input_reference"); err != nil {
+		if err := put(&vreq.FirstFrame, "first_frame", "first_frame_url", "input_reference"); err != nil {
 			httpx.Fail(w, r, err)
 			return
 		}
-		if err := put(&vreq.LastFrame, "last_frame"); err != nil {
+		if err := put(&vreq.LastFrame, "last_frame", "last_frame_url"); err != nil {
 			httpx.Fail(w, r, err)
 			return
 		}
-		refs, err := collectFiles(r, "image", "image[]")
+		refs, err := collectInputs(r, "image", "image[]", "input_reference[]")
 		if err != nil {
 			httpx.Fail(w, r, err)
 			return
 		}
 		vreq.References = refs
-		vids, err := collectFiles(r, "video", "video[]")
+		vids, err := collectInputs(r, "video", "video[]", "video_reference[]")
 		if err != nil {
 			httpx.Fail(w, r, err)
 			return
 		}
 		vreq.Videos = vids
-		auds, err := collectFiles(r, "audio", "audio[]")
+		auds, err := collectInputs(r, "audio", "audio[]", "audio_reference[]")
 		if err != nil {
 			httpx.Fail(w, r, err)
 			return
@@ -308,7 +317,54 @@ func (h *handler) createVideo(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, videoObject(task))
+	httpx.WriteJSON(w, http.StatusOK, h.videoJSON(r, task, nil))
+}
+
+// videoJSON is the task object a client sees. A vendor whose result needs
+// authentication (provider.VideoFetcher, e.g. Muse) would hand clients a link
+// they cannot open, so video_url points at the gateway's own /content proxy;
+// the stored ResultURL stays the vendor link the proxy downloads from.
+// cache memoizes the per-provider check across a list (nil for one task).
+func (h *handler) videoJSON(r *http.Request, t *store.VideoTask, cache map[string]bool) map[string]any {
+	obj := videoObject(t)
+	if _, ok := obj["video_url"]; ok && h.authedResult(r.Context(), t.ProviderID, cache) {
+		obj["video_url"] = requestBaseURL(r) + "/v1/videos/" + url.PathEscape(t.ID) + "/content"
+	}
+	return obj
+}
+
+func (h *handler) authedResult(ctx context.Context, providerID string, cache map[string]bool) bool {
+	if v, ok := cache[providerID]; ok {
+		return v
+	}
+	v := false
+	if p, err := h.st.GetProvider(ctx, providerID); err == nil {
+		if ad, ok := provider.Get(p.Type); ok {
+			_, v = ad.(provider.VideoFetcher)
+		}
+	}
+	if cache != nil {
+		cache[providerID] = v
+	}
+	return v
+}
+
+// requestBaseURL is the scheme://host the client reached, honoring a reverse
+// proxy's X-Forwarded-Proto / X-Forwarded-Host.
+func requestBaseURL(r *http.Request) string {
+	first := func(v string) string { return strings.TrimSpace(strings.Split(v, ",")[0]) }
+	scheme := first(r.Header.Get("X-Forwarded-Proto"))
+	if scheme == "" {
+		scheme = "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+	}
+	host := first(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
 }
 
 func videoObject(t *store.VideoTask) map[string]any {
@@ -346,7 +402,7 @@ func (h *handler) getVideo(w http.ResponseWriter, r *http.Request) {
 	}
 	if terminal(t.Status) ||
 		(t.LastPolledAt != nil && h.now().Sub(*t.LastPolledAt) < time.Second) {
-		httpx.WriteJSON(w, http.StatusOK, videoObject(t))
+		httpx.WriteJSON(w, http.StatusOK, h.videoJSON(r, t, nil))
 		return
 	}
 	h.pollTask(w, r, t)
@@ -361,12 +417,12 @@ func (h *handler) pollTask(w http.ResponseWriter, r *http.Request, t *store.Vide
 		t.Error = msg
 		t.CompletedAt = &now
 		_ = h.st.UpdateVideoTask(r.Context(), t)
-		httpx.WriteJSON(w, http.StatusOK, videoObject(t))
+		httpx.WriteJSON(w, http.StatusOK, h.videoJSON(r, t, nil))
 	}
 	keep := func(err error) {
 		slog.Warn("video poll failed, keeping state", "task", t.ID, "err", err)
 		_ = h.st.UpdateVideoTask(r.Context(), t)
-		httpx.WriteJSON(w, http.StatusOK, videoObject(t))
+		httpx.WriteJSON(w, http.StatusOK, h.videoJSON(r, t, nil))
 	}
 
 	res, err := h.taskResolved(r.Context(), t)
@@ -413,7 +469,7 @@ func (h *handler) pollTask(w http.ResponseWriter, r *http.Request, t *store.Vide
 		httpx.Fail(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, videoObject(t))
+	httpx.WriteJSON(w, http.StatusOK, h.videoJSON(r, t, nil))
 }
 
 // taskResolved rebuilds the Resolved for a stored video task — the provider
@@ -533,8 +589,9 @@ func (h *handler) listVideos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := make([]map[string]any, 0, len(tasks))
+	cache := map[string]bool{}
 	for _, t := range tasks {
-		data = append(data, videoObject(t))
+		data = append(data, h.videoJSON(r, t, cache))
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
