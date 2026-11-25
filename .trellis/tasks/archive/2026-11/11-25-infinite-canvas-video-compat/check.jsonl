@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/openai-api.md", "reason": "verify spec updated with new aliases and video_url rule"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "go test / go vet gate"}
