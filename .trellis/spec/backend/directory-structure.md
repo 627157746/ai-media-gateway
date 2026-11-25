@@ -25,8 +25,7 @@ ai-media-gateway/
 │   ├── web/                     # embedded admin SPA: web.go (go:embed) + assets/ (vanilla JS)
 │   └── admin/admin.go           # /admin/* JSON API
 ├── internal/store/migrations/001_init.sql
-├── Dockerfile, docker-compose.yml, .env.example, README.md (Chinese), AGENTS.md
-└── Infinite Canvas.md           # client contract source — do not edit
+└── Dockerfile, docker-compose.yml, .env.example, README.md (Chinese), AGENTS.md
 ```
 
 ## Dependency direction
